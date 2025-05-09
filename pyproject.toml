@@ -1,0 +1,29 @@
+[project]
+name = "fastq-purge"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Federico Agostini", email = "federico.agostini@scilifelab.se" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "biopython>=1.85",
+    "maturin>=1.8.3",
+    "pyfastx>=2.2.0",
+    "rbloom>=1.5.2",
+    "rich>=14.0.0",
+    "rich-argparse>=1.7.0",
+]
+
+[project.scripts]
+fastq-purge = "fastq_purge.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11.8",
+]
