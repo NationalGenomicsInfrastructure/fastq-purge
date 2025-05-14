@@ -2,13 +2,13 @@ import argparse
 import gzip
 import logging
 import pathlib
-from importlib.metadata import version
-import pyfastx
 import re
 import sys
 from hashlib import sha256
+from importlib.metadata import version
 from pickle import dumps
 
+import pyfastx
 from Bio.SeqIO.QualityIO import FastqGeneralIterator
 from rbloom import Bloom
 from rich.logging import RichHandler
@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Parsed arguments.
     """
     parser = argparse.ArgumentParser(
-        prog="%(prog)s",
+        prog=f"{sys.argv[0].split('/')[-1]}",
         usage="%(prog)s [options]",
         description="Package to purge fastq files from unwanted reads",
         formatter_class=ArgumentDefaultsRichHelpFormatter,
@@ -43,10 +43,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-path",
         type=pathlib.Path,
-        help= ("Path to the target fastq file(s) to purge. It can be gzipped or not. ",
-             "It can be a single file or a directory. If a directory is provided, ",
-             "all files in the directory that match the pattern '*.fq*' or '*.fastq*' ",
-             "will be used as target files. The search is non-recursive."),
+        help="""Path to the target fastq file(s) to purge. It can be gzipped or not.
+        It can be a single file or a directory. If a directory is provided,
+        all files in the directory that match the pattern '*.fq*' or '*.fastq*'
+        will be used as target files. The search is non-recursive.""",
         required=True,
     )
     parser.add_argument(
@@ -66,10 +66,10 @@ def parse_args() -> argparse.Namespace:
         "--bloom-sources",
         type=pathlib.Path,
         default=None,
-        help=("Path to the bloom filter sources file(s). They can be gzipped or not. ",
-              "It can be a single file or multiple files separated by spaces, or a directory. ",
-              "If a directory is provided, all files in the directory that match the pattern ",
-              "'*.fq*' or '*.fastq*' will be used as bloom filter sources. The search is recursive."),
+        help="""Path to the bloom filter sources file(s). They can be gzipped or not.
+        It can be a single file or multiple files separated by spaces, or a directory.
+        If a directory is provided, all files in the directory that match the pattern
+        '*.fq*' or '*.fastq*' will be used as bloom filter sources. The search is recursive.""",
         required=True,
         nargs="+",
     )
@@ -94,15 +94,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"%(prog)s {version('fastq_purge')}",
+        version=f"%(prog)s {version('fastq-purge')}",
         help="Show version and exit",
     )
     return parser.parse_args()
 
 
-def validate_args(
-    args: argparse.Namespace
-) -> argparse.Namespace:
+def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     """
     Validate command line arguments.
 
@@ -111,6 +109,7 @@ def validate_args(
     Returns:
         argparse.Namespace: Validated arguments.
     """
+
     def explode_path(path: pathlib.Path, recursive: bool = False) -> list[pathlib.Path]:
         """
         Explode a path into a list of files or directories.
@@ -130,7 +129,11 @@ def validate_args(
             exit(1)
 
     # Create the list of all target files
-    args.target_path = [ x for x in explode_path(args.target_path, recursive=False) if "purged" not in x.name ]
+    args.target_path = [
+        x
+        for x in explode_path(args.target_path, recursive=False)
+        if "purged" not in x.name
+    ]
     _logger.info("Target files:")
     for i, target in enumerate(args.target_path):
         _logger.info(f"    {i + 1:02d}: '{target}'")
@@ -139,13 +142,19 @@ def validate_args(
     if args.output_path:
         args.output_path = pathlib.Path(args.output_path)
         if not args.output_path.is_dir():
-            _logger.debug(
-                f"The output path does not exist! It will be created..."
-            )
+            _logger.debug(f"The output path does not exist! It will be created...")
             args.output_path.mkdir(parents=True, exist_ok=True)
 
     # Create the list of all bloom sources
-    args.bloom_sources = list(set([ bs for bloom_source in args.bloom_sources for bs in explode_path(bloom_source, recursive=True) ]))
+    args.bloom_sources = list(
+        set(
+            [
+                bs
+                for bloom_source in args.bloom_sources
+                for bs in explode_path(bloom_source, recursive=True)
+            ]
+        )
+    )
 
     # Valiedate the bloom sources, removing unnecessary files (e.g. retain only one of the paired reads)
     sources_set = set()
@@ -197,7 +206,7 @@ def build_bloom_filter(
     bf = Bloom(max_items, fpr, hash_func)
     for bloom_source in bloom_sources:
         _logger.debug(f"Adding '{bloom_source.name}' to bloom filter")
-        for name,_,_ in pyfastx.Fastq(str(bloom_source), build_index=False):
+        for name, _, _ in pyfastx.Fastq(str(bloom_source), build_index=False):
             bf.add(name)
         # # Alternatively, it is possible to retrieve all names at once, however this might
         # # be memory intensive for large files, though it has not been tested yet
@@ -205,8 +214,13 @@ def build_bloom_filter(
         # bf.update(fq.keys())
     return bf
 
+
 def process_target_file(
-    target: pathlib.Path, output_path: pathlib.Path, bloom_filter: Bloom, keep_raw_names: bool = False) -> None:
+    target: pathlib.Path,
+    output_path: pathlib.Path,
+    bloom_filter: Bloom,
+    keep_raw_names: bool = False,
+) -> None:
     """
     Process the target file and remove reads that are in the bloom filter.
     Args:
@@ -221,9 +235,7 @@ def process_target_file(
     valid = 0
     if target.suffix == ".gz":
         fq_suffix = target.with_suffix("").suffix
-        output_file = target.with_suffix("").with_suffix(
-            f".purged{fq_suffix}.gz"
-        )
+        output_file = target.with_suffix("").with_suffix(f".purged{fq_suffix}.gz")
     else:
         fq_suffix = target.suffix
         output_file = target.with_suffix(f".purged{fq_suffix}")
@@ -242,7 +254,11 @@ def process_target_file(
             # Although the biopython implementation might be slower, it is allows to
             # retain the full read name, including the read index information
             _logger.info(f"Reading target fastq file using biopython...")
-            with gzip.open(target, "rt") if target.suffix == ".gz" else open(target, "rt") as input_fastq:
+            with (
+                gzip.open(target, "rt")
+                if target.suffix == ".gz"
+                else open(target, "rt") as input_fastq
+            ):
                 for title, seq, qual in FastqGeneralIterator(input_fastq):
                     # The read name is the first part of the title
                     read_name = title.split(" ")[0]
@@ -252,13 +268,12 @@ def process_target_file(
                     total += 1
                     if total % 1000000 == 0:
                         _logger.info(f"    Processed {total} reads")
-                        
 
         else:
             # If the full read name is not needed, it is possible to use pyfastx
             # to read the fastq file, which is faster than biopython
             _logger.info(f"Reading target fastq file using pyfastx...")
-            for name, seq, qual  in pyfastx.Fastq(str(target), build_index=False):
+            for name, seq, qual in pyfastx.Fastq(str(target), build_index=False):
                 if not name in bloom_filter:
                     output_fastq.write(f"@{name}\n{seq}\n+\n{qual}\n")
                     valid += 1
@@ -269,6 +284,7 @@ def process_target_file(
     logging.info(f"    Removed {total - valid} reads")
     logging.info(f"    Kept {valid} reads")
     logging.info(f"    Purged fastq file saved to '{output_file}'")
+
 
 def main() -> None:
     """Main function to run the script."""
@@ -282,9 +298,7 @@ def main() -> None:
     args = validate_args(args)
 
     _logger.info(f"Building bloom filter...")
-    bf = build_bloom_filter(
-        args.bloom_sources, args.max_items, args.fpr
-    )
+    bf = build_bloom_filter(args.bloom_sources, args.max_items, args.fpr)
     # Log the bloom filter parameters
     _logger.debug(f"Bloom filter size: {bf.size_in_bits} bits")
     # _logger.debug(f"Hash functions: {bf.hash_func}")
@@ -295,7 +309,7 @@ def main() -> None:
         _logger.info(f"Processing target file '{target}'")
         process_target_file(target, args.output_path, bf, args.raw_names)
     _logger.info("Done!")
-    
+
 
 if __name__ == "__main__":
     main()
