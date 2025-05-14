@@ -142,7 +142,7 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     if args.output_path:
         args.output_path = pathlib.Path(args.output_path)
         if not args.output_path.is_dir():
-            _logger.debug(f"The output path does not exist! It will be created...")
+            _logger.debug("The output path does not exist! It will be created...")
             args.output_path.mkdir(parents=True, exist_ok=True)
 
     # Create the list of all bloom sources
@@ -253,7 +253,7 @@ def process_target_file(
         if keep_raw_names:
             # Although the biopython implementation might be slower, it is allows to
             # retain the full read name, including the read index information
-            _logger.info(f"Reading target fastq file using biopython...")
+            _logger.info("Reading target fastq file using biopython...")
             with (
                 gzip.open(target, "rt")
                 if target.suffix == ".gz"
@@ -262,7 +262,7 @@ def process_target_file(
                 for title, seq, qual in FastqGeneralIterator(input_fastq):
                     # The read name is the first part of the title
                     read_name = title.split(" ")[0]
-                    if not read_name in bloom_filter:
+                    if read_name not in bloom_filter:
                         output_fastq.write(f"@{title}\n{seq}\n+\n{qual}\n")
                         valid += 1
                     total += 1
@@ -272,9 +272,9 @@ def process_target_file(
         else:
             # If the full read name is not needed, it is possible to use pyfastx
             # to read the fastq file, which is faster than biopython
-            _logger.info(f"Reading target fastq file using pyfastx...")
+            _logger.info("Reading target fastq file using pyfastx...")
             for name, seq, qual in pyfastx.Fastq(str(target), build_index=False):
-                if not name in bloom_filter:
+                if name not in bloom_filter:
                     output_fastq.write(f"@{name}\n{seq}\n+\n{qual}\n")
                     valid += 1
                 total += 1
@@ -297,7 +297,7 @@ def main() -> None:
     # Validate the command line arguments
     args = validate_args(args)
 
-    _logger.info(f"Building bloom filter...")
+    _logger.info("Building bloom filter...")
     bf = build_bloom_filter(args.bloom_sources, args.max_items, args.fpr)
     # Log the bloom filter parameters
     _logger.debug(f"Bloom filter size: {bf.size_in_bits} bits")
