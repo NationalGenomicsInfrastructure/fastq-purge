@@ -9,11 +9,11 @@ authors = [
 requires-python = ">=3.11"
 dependencies = [
     "biopython>=1.85",
+    "dnaio>=1.2.3",
+    "loky>=3.5.3",
     "maturin>=1.8.3",
-    "needletail>=0.7.0",
-    "numpy>=2.2.5",
-    "pgzip>=0.3.5",
-    "pyfastx>=2.2.0",
+    "multiprocess>=0.70.18",
+    "psutil>=7.0.0",
     "rbloom>=1.5.2",
     "rich>=14.0.0",
     "rich-argparse>=1.7.0",
