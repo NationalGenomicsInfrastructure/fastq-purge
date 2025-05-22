@@ -13,7 +13,7 @@ import dnaio
 import multiprocess as mp
 import psutil
 from loky import get_reusable_executor
-from multiprocess import Process
+from multiprocess import Process, Semaphore
 from multiprocess.managers import BaseManager
 from multiprocess.pool import Pool
 from rbloom import Bloom
@@ -150,8 +150,14 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     def explode_path(path: pathlib.Path, recursive: bool = False) -> list[pathlib.Path]:
         """
         Explode a path into a list of files or directories.
-        If the path is a directory, it will return all files in the directory that match the pattern '*.fq*' or '*.fastq*'.
-        If the path is a file, it will return the file itself.
+        If the path is a directory, it will return all files in the directory that match
+        the pattern '*.fq*' or '*.fastq*'. If the path is a file, it will return the file itself.
+
+        Args:
+            path (pathlib.Path): Path to the target file or directory.
+            recursive (bool): Whether to search recursively in the directory.
+        Returns:
+            list[pathlib.Path]: List of files or directories.
         """
         patterns = ["**/*.fq*", "**/*.fastq*"] if recursive else ["*.fq*", "*.fastq*"]
         if path.is_dir():
@@ -167,8 +173,13 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
 
     def create_paired_dict(path: list[pathlib.Path]) -> dict[str, list[pathlib.Path]]:
         """
-        Create a dictionary of paired files from the undetermined path.
-        The keys are the lane numbers and the values are lists of paired files.
+        Create a dictionary of paired files from the list of paths.
+        The keys are the lane numbers and the values are tuples of paired files.
+
+        Args:
+            path (list[pathlib.Path]): List of paths to the target files.
+        Returns:
+            dict[str, list[pathlib.Path]]: Dictionary of paired files.
         """
         # Create the list of all target files
         path = [
@@ -292,6 +303,10 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
 def memory_usage(logger, pid: int = None) -> None:
     """
     Print the memory usage of the current process.
+
+    Args:
+        logger (logging.Logger): Logger to use for logging the memory usage.
+        pid (int, optional): Process ID to check memory usage for. If None, uses the current process.
     """
     vmem = psutil.virtual_memory()
     smem = psutil.swap_memory()
@@ -317,8 +332,14 @@ def build_bloom_filter(
 
     def hash_func(obj):
         """
-        Hash function to be used for the bloom filter.
-        It uses SHA256 to hash the object and returns the first 16 bytes as an integer.
+        Hash function to use for the bloom filter. It uses SHA256 to hash the object and
+        returns the first 16 bytes as an integer.
+        This is a simple hash function, but it can be replaced with a more complex one if needed.
+
+        Args:
+            obj: The object to hash.
+        Returns:
+            int: The hash value. Hash function to be used for the bloom filter.
         """
         # Use the first 16 bytes of the SHA256 hash as the hash value
         # This is a simple hash function, but it can be replaced with a more complex one if needed
@@ -350,14 +371,15 @@ def process_target_file(
 ) -> None:
     """
     Process the target file and remove reads that are in the bloom filter.
+
     Args:
         target (pathlib.Path): Path to the target fastq file.
         bloom_filter (Bloom): The bloom filter to use for filtering.
     """
 
-    # # Read the target fastq file and write the purged reads to the output file
-    # # Building the index allows access to the read.raw property, which contains the full read name
-    # # If the full read name is not needed, it is possible drop the index generation
+    # Read the target fastq file and write the purged reads to the output file
+    # Building the index allows access to the read.raw property, which contains the full read name
+    # If the full read name is not needed, it is possible drop the index generation
     total = 0
     valid = 0
     if target.suffix == ".gz":
@@ -393,6 +415,7 @@ def process_target_file(
 def build_undetermined_set(path: pathlib.Path) -> set:
     """
     Build a set of undetermined reads from the given path.
+
     Args:
         path (pathlib.Path): Path to the undetermined fastq file.
     Returns:
@@ -411,6 +434,15 @@ def build_undetermined_set(path: pathlib.Path) -> set:
 
 
 def get_logger(name: str, log_level: str = "INFO") -> logging.Logger:
+    """
+    Get a logger with the given name and log level. Used in child processes.
+
+    Args:
+        name (str): Name of the logger.
+        log_level (str): Log level to set for the logger.
+    Returns:
+        logging.Logger: The logger with the given name and log level.
+    """
     # Get the logger for the given name
     logger = logging.getLogger(name)
     # Set the logging level
@@ -425,10 +457,13 @@ def process_target_set(
 ) -> set:
     """
     Process the target file and remove reads that are in the undetermined set.
+
     Args:
         path (pathlib.Path): Path to the target fastq file.
         undetermined_set (set): Set of undetermined reads.
         buffer_size (int): Size of the buffer to use for processing.
+    Returns:
+        tuple: Tuple containing the process ID, target file name, and set of already assigned reads.
     """
     # Use the global variable to access the undetermined set
     undetermined_set = os.undetermined_set
@@ -463,9 +498,26 @@ def loky_process_target_set(
     threads: int = 1,
     log_level: str = "INFO",
 ) -> set:
+    """
+    Process the target file and remove reads that are in the undetermined set.
+
+    Args:
+        assigned_dict (dict): Dictionary of target files to process.
+        threads (int): Number of threads to use for processing.
+        log_level (str): Log level to set for the logger.
+    Returns:
+        set: Set of already assigned reads.
+    """
+
     # Hackish trick to pass a global variable to the child process
     # by mutating a global variable from a module (such as the os module)
     def set_value(value):
+        """
+        Set the value of the global variable in the child process.
+
+        Args:
+            value (set): The value to set for the global variable.
+        """
         _logger.info(f"Setting value in child process {os.getpid()}")
         os.undetermined_set = value
 
@@ -490,11 +542,15 @@ def loky_process_target_set(
 
 
 class CustomManager(BaseManager):
+    """Custom manager to share data between processes."""
+
     # nothing
     pass
 
 
 class MultiprocessingCustom:
+    """Custom class to be used with the multiprocessing manager."""
+
     # constructor
     def __init__(self, data):
         # store the data in the instance
@@ -504,6 +560,14 @@ class MultiprocessingCustom:
         self.log = dict()
 
     def intersect_and_update(self, subset) -> int:
+        """
+        Intersect the subset with the undetermined set and update the assigned set.
+
+        Args:
+            subset (set): The subset to intersect with the undetermined set.
+        Returns:
+            int: The number of reads that were already assigned.
+        """
         subset.intersection_update(self.undetermined)
         count = len(subset)
         self.assigned.update(subset)
@@ -512,6 +576,13 @@ class MultiprocessingCustom:
 
     # perform the main task
     def task(self, path):
+        """
+        Perform the main task of the custom class.
+        Args:
+            path (pathlib.Path): Path to the target fastq file.
+        Returns:
+            tuple: Tuple containing the process ID, target file name, and number of already assigned reads.
+        """
         tmp_set = set()
         counts = 0
         with dnaio.open(path) as reader:
@@ -528,20 +599,34 @@ class MultiprocessingCustom:
 
     # view the log
     def view_log(self):
+        """View the log of the custom class."""
         for key, value in self.log.items():
             _logger.info(f"{key}: {value}")
 
     # get all stored values
     def get_assigned(self):
+        """Get all stored values."""
         return self.assigned
 
     # remove all stored values
     def clear_assigned(self):
+        """Remove all stored values."""
         return self.assigned.clear()
 
 
-# custom function to be executed in a child process
-def manager_work(shared_custom, path, log_level="INFO"):
+def manager_work(shared_custom, path, semaphore, log_level="INFO"):
+    """
+    Custom function to be executed in a child process.
+
+    Args:
+        shared_custom (MultiprocessingCustom): Shared custom class instance.
+        path (pathlib.Path): Path to the target fastq file.
+        semaphore (Semaphore): Semaphore to limit the number of concurrent processes.
+        log_level (str): Log level to set for the logger.
+    """
+    # acquire the semaphore
+    semaphore.acquire()
+    # create a logger for the process
     logger = get_logger("multiprocessing", log_level)
     pid = os.getpid()
     logger.debug(f"Process {pid} started: {path.name} with {mp.get_start_method()}")
@@ -549,9 +634,20 @@ def manager_work(shared_custom, path, log_level="INFO"):
     name, number = shared_custom.task(path)
     # return the result
     logger.info(f"Process {pid} finished: {name} {number}")
+    # release the semaphore
+    semaphore.release()
 
 
 def pool_task(path, log_level="INFO") -> tuple:
+    """
+    Custom function to be executed in a child process.
+
+    Args:
+        path (pathlib.Path): Path to the target fastq file.
+        log_level (str): Log level to set for the logger.
+    Returns:
+        tuple: Tuple containing the process ID, target file name, and set of already assigned reads.
+    """
     logger = get_logger("multiprocessing", log_level)
     pid = os.getpid()
     logger.debug(f"Process {pid} started: {path.name} with {mp.get_start_method()}")
@@ -582,6 +678,17 @@ def multiprocessing_process_target_set(
     log_level: str = "INFO",
     method: str = "pool",  # either "manager" or "pool"
 ) -> None:
+    """
+    Process the target file and remove reads that are in the undetermined set.
+
+    Args:
+        assigned_dict (dict): Dictionary of target files to process.
+        threads (int): Number of threads to use for processing.
+        log_level (str): Log level to set for the logger.
+        method (str): Method to use for multiprocessing. Either "manager" or "pool".
+    Returns:
+        set: Set of already assigned reads.
+    """
     mp.set_start_method("fork", force=True)
 
     already_assigned = set()
@@ -595,13 +702,15 @@ def multiprocessing_process_target_set(
             # create a shared custom class instance
             shared_custom = manager.MultiprocessingCustom(undetermined_set)
             memory_usage(_logger)
+            semaphore = Semaphore(threads)
             for as_lane, targets in assigned_dict.items():
                 _logger.debug(
-                    f"Creating {len(targets)} child processes for lane {as_lane}"
+                    f"Creating {len(targets)} child processes for lane '{as_lane}'"
                 )
                 processes = [
                     Process(
-                        target=manager_work, args=(shared_custom, target, log_level)
+                        target=manager_work,
+                        args=(shared_custom, target, semaphore, log_level),
                     )
                     for target in targets
                 ]
@@ -630,7 +739,7 @@ def multiprocessing_process_target_set(
                 )
             for res in results:
                 already_assigned.update(res[1])
-        return already_assigned
+    return already_assigned
 
 
 def write_purged_fastq(
@@ -641,10 +750,12 @@ def write_purged_fastq(
 ) -> None:
     """
     Write the purged fastq file.
+
     Args:
         path_undetermined (pathlib.Path): Path to the undetermined fastq file.
         path_purged (pathlib.Path): Path to the purged fastq file.
         assigned_set (set): Set of already assigned reads.
+        threads (int): Number of threads to use for processing.
     """
     if path_undetermined[1] is None or path_purged[1] is None:
         _logger.info(f"Writing purged fastq file '{path_purged[0].name}'")
@@ -693,6 +804,7 @@ def main() -> None:
     if args.method == "bloom":
         _logger.info("Using bloom filter method")
         _logger.info("Building bloom filter...")
+        # Create a bloom filter with the given parameters
         bf = build_bloom_filter(args.undetermined_path, args.max_items, args.fpr)
         # Log the bloom filter parameters
         _logger.debug(f"Bloom filter size: {bf.size_in_bits} bits")
@@ -710,34 +822,28 @@ def main() -> None:
         for un_lane, (un_file_1, un_file_2) in args.undetermined_path.items():
             undetermined_set = build_undetermined_set(un_file_1)
             undetermined_count = len(undetermined_set)
+            set_size_mb = sys.getsizeof(undetermined_set) / 1024**2
             _logger.info(
-                f"Number of undetermined reads: {undetermined_count} ({sys.getsizeof(undetermined_set) / 1024**2:.2f} MB)"
+                f"Number of undetermined reads: {undetermined_count} ({set_size_mb:.2f} MB)"
             )
 
             memory_usage(_logger)
-            if args.threads > 1:
-                if args.threading_method == "loky":
-                    # Loky executor
-                    already_assigned = loky_process_target_set(
-                        args.assigned_path,
-                        threads=args.threads,
-                        log_level=args.log_level,
-                    )
-                else:
-                    method = "pool" if args.threading_method == "mp_pool" else "manager"
-                    # Multiprocessing
-                    already_assigned = multiprocessing_process_target_set(
-                        args.assigned_path,
-                        threads=args.threads,
-                        log_level=args.log_level,
-                        method=method,
-                    )
+            if args.threading_method == "loky":
+                # Loky executor
+                already_assigned = loky_process_target_set(
+                    args.assigned_path,
+                    threads=args.threads,
+                    log_level=args.log_level,
+                )
             else:
-                _logger.info("Purging already assigned reads...")
-                for as_lane, targets in args.assigned_path.items():
-                    for target in targets:
-                        res = process_target_set(target, undetermined_set)
-                        already_assigned.update(res[2])
+                # Multiprocess
+                method = "pool" if args.threading_method == "mp_pool" else "manager"
+                already_assigned = multiprocessing_process_target_set(
+                    args.assigned_path,
+                    threads=args.threads,
+                    log_level=args.log_level,
+                    method=method,
+                )
 
             _logger.info(
                 f"Found {len(already_assigned)} duplicates in the undetermined file."
