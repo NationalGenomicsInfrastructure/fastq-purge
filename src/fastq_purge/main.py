@@ -80,6 +80,17 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
     )
     parser.add_argument(
+        "--method",
+        type=str,
+        default="exact",
+        choices=["exact", "approx"],
+        help="""Method to use for filtering. The 'exact' method uses a python set to store 
+        the undetermined reads. The 'approx' method uses a bloom filter to store the undetermined
+        reads. The 'exact' method is more resource intensive, but it is more accurate. The
+        'approx' method is less resource intensive, but it has a false positive rate associated with it.
+        """,
+    )
+    parser.add_argument(
         "--max-items",
         type=int,
         default=1000000000,
@@ -94,22 +105,6 @@ def parse_args() -> argparse.Namespace:
         help="False positive rate for the bloom filter. The default is 0.0001.",
     )
     parser.add_argument(
-        "--method",
-        type=str,
-        default="exact",
-        choices=["exact", "bloom"],
-        help="""Method to use for filtering. The 'exact' method uses a python set to store 
-        the undetermined reads. The 'bloom' method uses a bloom filter to store the undetermined
-        reads. The 'exact' method is more resource intensive, but it is more accurate. The
-        'bloom' method is less resource intensive, but it has a false positive rate.""",
-    )
-    parser.add_argument(
-        "--threads",
-        type=int,
-        default=1,
-        help="Number of threads to use for processing",
-    )
-    parser.add_argument(
         "--threading-method",
         type=str,
         default="mp_pool",
@@ -121,6 +116,12 @@ def parse_args() -> argparse.Namespace:
         serialization using the dill library. 'mp_manager' uses the multiprocess library with a custom
         manager to share data between processes. The 'mp_pool' and 'mp_manager' methods are
         equivalent, but the 'mp_pool' method less resource intensive.""",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=1,
+        help="Number of threads to use for processing",
     )
     parser.add_argument(
         "--log-level",
@@ -801,7 +802,7 @@ def main() -> None:
     # Validate the command line arguments
     args = validate_args(args)
 
-    if args.method == "bloom":
+    if args.method == "approx":
         _logger.info("Using bloom filter method")
         _logger.info("Building bloom filter...")
         # Create a bloom filter with the given parameters
