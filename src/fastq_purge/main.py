@@ -4,10 +4,8 @@ import os
 import pathlib
 import re
 import sys
-from hashlib import sha256
 from importlib.metadata import version
 from itertools import repeat
-from pickle import dumps
 
 import dnaio
 import multiprocess as mp
@@ -223,6 +221,8 @@ def validate_args(args: argparse.Namespace) -> argparse.Namespace:
     if not args.output_path.is_dir():
         _logger.debug("The output path does not exist! It will be created...")
         args.output_path.mkdir(parents=True, exist_ok=True)
+    # Keep the output directory around (args.output_path becomes a per-lane dict below)
+    args.output_dir = args.output_path
     output_dict = dict()
     for key, values in args.undetermined_path.items():
         output_list = []
@@ -331,23 +331,9 @@ def build_bloom_filter(
         Bloom: The constructed bloom filter.
     """
 
-    def hash_func(obj):
-        """
-        Hash function to use for the bloom filter. It uses SHA256 to hash the object and
-        returns the first 16 bytes as an integer.
-        This is a simple hash function, but it can be replaced with a more complex one if needed.
-
-        Args:
-            obj: The object to hash.
-        Returns:
-            int: The hash value. Hash function to be used for the bloom filter.
-        """
-        # Use the first 16 bytes of the SHA256 hash as the hash value
-        # This is a simple hash function, but it can be replaced with a more complex one if needed
-        # The hash value is converted to an integer
-        # using the system byte order and signed=True to allow negative values
-        h = sha256(dumps(obj)).digest()
-        return int.from_bytes(h[:16], sys.byteorder, signed=True)
+    # Use Python's builtin string hash (fast, 64-bit). The filter is built and
+    # queried within the same process, so the per-process hash seed is consistent.
+    hash_func = hash
 
     # Create a bloom filter with the given parameters
     bf = Bloom(max_items, fpr, hash_func)
@@ -805,17 +791,23 @@ def main() -> None:
     if args.method == "approx":
         _logger.info("Using bloom filter method")
         _logger.info("Building bloom filter...")
-        # Create a bloom filter with the given parameters
-        bf = build_bloom_filter(args.undetermined_path, args.max_items, args.fpr)
+        # Create a bloom filter from the undetermined R1 files (one per lane)
+        un_r1_files = [
+            un_file_1
+            for un_file_1, _ in args.undetermined_path.values()
+            if un_file_1 is not None
+        ]
+        bf = build_bloom_filter(un_r1_files, args.max_items, args.fpr)
         # Log the bloom filter parameters
         _logger.debug(f"Bloom filter size: {bf.size_in_bits} bits")
         # _logger.debug(f"Hash functions: {bf.hash_func}")
         _logger.debug(f"Number of items: {bf.approx_items:.1f}")
 
         # Process the target files and remove reads that are in the bloom filter
-        for target in args.assigned_path:
-            _logger.info(f"Processing target file '{target}'")
-            process_target_file(target, args.output_path, bf, args.threads)
+        for targets in args.assigned_path.values():
+            for target in targets:
+                _logger.info(f"Processing target file '{target}'")
+                process_target_file(target, args.output_dir, bf, args.threads)
     else:
         _logger.info("Using exact method")
         memory_usage(_logger)
