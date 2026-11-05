@@ -1,0 +1,265 @@
+# fastq-purge — Rust rewrite design
+
+Status: DRAFT for review · Profiled: 2026-11-04 · Scope: full rewrite of the `fastq-purge` package as a standalone Rust binary.
+
+## 1. Motivation & measured baseline
+
+Current state (Python 3.11, `src/fastq_purge/main.py`, 869 lines, single file):
+
+| Phase (5M-read synthetic set, 20% engineered duplicates) | Time | Per record |
+|---|---|---|
+| exact: build set from undetermined R1 (`build_undetermined_set`) | 2.93 s | 0.59 µs |
+| exact: scan assigned files (`pool_task`) | 3.96 s | 0.79 µs |
+| exact: re-read undetermined, write purged (`write_purged_fastq`) | 2.21 s | 0.44 µs |
+| **exact total (single process)** | **9.1 s** | ~1.8 µs |
+| approx: build bloom from undetermined (`build_bloom_filter`) | 7.96 s | 1.59 µs |
+| approx: filter + write (`process_target_file`, gzip L7) | 30.46 s | 6.09 µs |
+| **approx total** | **38.4 s** | ~7.7 µs |
+
+Memory: Python set of name-strings ≈ 90–120 B/name → **~9–12 GB at 100 M names** (the practical RAM wall for NovaSeqX-scale undetermined files).
+
+Microbench (per record): `sha256(pickle.dumps(name))` = 0.53 µs vs builtin `hash()` = 0.022 µs; rbloom `add`/`contains` with the current sha256(pickle) hash ≈ 1.1 µs each — the hash function, not the set logic, dominates the approx path.
+
+### Problems beyond speed
+
+1. **The released `--method approx` CLI path is broken.** `main()` passes the lane→pair **dict** to `build_bloom_filter()`, which iterates it as if it were a list of files → `AttributeError: 'str' object has no attribute 'name'` (reproduced 2026-11-04). Approx has only ever worked via direct function calls.
+2. **The two methods do opposite things.** exact purges the **undetermined** file (removes undetermined reads whose names appear in assigned files — the documented intent). approx purges the **assigned** file (removes assigned reads whose full names appear in the undetermined bloom). Output files, counts, and semantics differ.
+3. **The comparison key differs per method**: exact uses `name.split(" ")[0]` (name0 = instrument:run:lane:tile:x:y), approx uses the **full** `record.name` (including the index sequence). On real Illumina data name0 is globally unique per cluster, so the difference is usually small — but on data with duplicate name0s (multi-run concatenations, some platforms) the methods diverge.
+4. **Fragile concurrency**: `mp.set_start_method("fork", force=True)`, three interchangeable threading backends (`loky`/`mp_pool`/`mp_manager`), global module variables shared across forked workers, results shipped as pickled sets over process boundaries, 1 M-record intersection-update batching.
+5. **Three passes over the data per undetermined lane**, and in multi-lane runs the assigned files are re-scanned **once per undetermined lane** (main loop: `for un_lane in undetermined_path: build set → scan ALL assigned → write`).
+6. Bloom sized for 1 B items by default (`--max-items 1e9`): a 2.4 GB bit array even when the run has 10 M reads.
+
+### What a rewrite buys
+
+- 1 pass structure per concern, 1 concurrency model (threads), 0 pickling of sets.
+- ~5–10× less memory (u64 hashes vs strings; ~2 GB at 100 M names vs ~10–12 GB).
+- 2–5× wall time at production scale (I/O-bound floor is gzip; per-record CPU is 10–50× faster).
+- Both methods work, do the same thing, with documented (or explicitly flagged) differences.
+- Single static binary; no Python/deps to ship.
+
+## 2. Goals / non-goals
+
+**Goals**
+
+- CLI drop-in replacement (same flags, same file-discovery rules, same output naming; see §7 checklist).
+- exact + approx membership, both purging **undetermined** (canonical direction, §3).
+- Correctness-first: differential-tested against the current Python exact path.
+- Memory bounded and documented (§6).
+
+**Non-goals**
+
+- Python bindings (this is a standalone tool, not a library).
+- Changing the on-disk FASTQ/BCL formats.
+- Parallel decompression *within* one gzip stream (across files/lanes is enough; revisit if profiling shows a wall).
+- Index-file-aware purging (R1/R2/I1/I2 collapsing stays as a file-selection rule only).
+
+## 3. Canonical semantics (decision points)
+
+The rewrite must decide the three divergences above. Recommendation:
+
+| # | Decision | Recommended | Rationale |
+|---|---|---|---|
+| D1 | Purge direction | **Purge undetermined** in both methods (remove undetermined reads whose name appears in any assigned file) | Matches README intent and the exact method's behaviour; approx's current direction is an accident of the broken path. |
+| D2 | Comparison key | **name0** (`record.name` up to first space) in both methods | name0 identifies the cluster (lane/tile/x/y); index sequences are not part of identity. exact already uses it. |
+| D3 | Preserve approx's old behaviour? | Optional `--purge-assigned` flag (default off) that inverts D1, for anyone relying on it | Cheap to implement (same pipeline, swap roles); keeps the door open. |
+
+Each decision must be called out in the changelog; D1/D2 change observable output for edge-case inputs.
+
+## 4. Architecture
+
+```
+fastq-purge/
+└── (Rust workspace)
+    ├── Cargo.toml
+    └── src/
+        ├── main.rs        # entry point: parse → validate → dispatch
+        ├── cli.rs         # clap definitions + validation (§7 parity rules)
+        ├── fastq/
+        │   ├── mod.rs
+        │   ├── read.rs    # streaming FASTQ(.gz) reader: name0 + raw record
+        │   └── write.rs   # gzip writer (level 7), single- and paired-stream
+        ├── membership/
+        │   ├── mod.rs
+        │   ├── exact.rs   # HashSet<u64> of xxhash64(name0)
+        │   └── bloom.rs   # bitvec + xxh128 (two 64-bit halves)
+        └── pipeline.rs    # passes, rayon orchestration, progress reporting
+```
+
+Dependencies: `clap` (derive), `flate2` (miniz_oxide backend; multi-member aware), `rayon`, `xxhash-rust`, `bitvec`, `thiserror`/`anyhow`, `tracing` + `tracing-subscriber` (stderr, plain format), `indicatif` optional (only if we relax log-format parity).
+
+### Key data structures
+
+```rust
+// fastq/read.rs
+pub struct NameCursor { /* position of next record in the decompressed stream */ }
+
+/// Extract name0 (bytes up to the first b' ') from the header line,
+/// then advance to the start of the next record.
+pub trait NameReader {
+    fn next_name0(&mut self) -> Option<Result<&[u8], FastqError>>;
+}
+
+// write.rs: paired writer that consumes (r1_bytes, r2_bytes) in lockstep.
+
+// membership/exact.rs
+pub struct ExactSet { inner: HashSet<u64> }
+impl ExactSet {
+    pub fn insert_name(&mut self, name0: &[u8]) {
+        self.inner.insert(xxhash_h64(name0, 0));
+    }
+    pub fn contains_name(&self, name0: &[u8]) -> bool {
+        self.inner.contains(&xxhash_h64(name0, 0))
+    }
+}
+
+// membership/bloom.rs
+pub struct Bloom64 {
+    bits: BitVec,          // size per §6
+    k: u32,                // 2 (one per 64-bit half of xxh128)
+}
+impl Bloom64 {
+    pub fn new(n_items: u64, fpr: f64) -> Self;  // m, k per §6 formulas
+    pub fn insert_name(&mut self, name0: &[u8]);  // xxh128 → two bit probes
+    pub fn contains_name(&self, name0: &[u8]) -> bool;
+}
+```
+
+Name extraction detail (the hot primitive): read the decompressed stream in 256 KiB chunks; find the next `\n` (header end), then the first ` ` in the header (name0 end — if absent, name0 = whole header); hash the slice; then skip 3 more `\n`s (FASTQ is strictly 4 lines/record). No per-record allocation, no full-record parse for membership passes. For the write pass, buffer the 4 raw lines as one owned `Vec<u8>` per record (only for kept records).
+
+## 5. Pass structure
+
+Canonical pipeline (D1/D2):
+
+```
+pass 1 — build membership          (one thread per undetermined lane, rayon)
+  for each undetermined lane L:
+      stream undetermined R1 (L):  name0 → insert into set/bloom for L
+  (multi-lane: K independent sets, one per undetermined lane — the current
+   Python re-scans assigned K times; we scan once and test against all K)
+
+pass 2 — find duplicates           (one thread per assigned file, rayon)
+  for each assigned file A (all lanes, R1-only after pair/index collapse):
+      stream A: for each name0: for each undetermined lane L with a set:
+          if set_L.contains(name0): dups_L.add(name0)     // or count only
+
+pass 3 — write purged undetermined (one thread per undetermined lane, rayon)
+  for each undetermined lane L:
+      if dups_L empty → log "Found no duplicates..." ; write NOTHING (parity!)
+      else stream (R1, R2) pair:
+          if !set_of(dups_L).contains(name0): write r1, r2
+```
+
+Notes:
+
+- Pass 2 only needs the **set of duplicate names** (not counts) — `dups_L` is a `HashSet<u64>` of hash values (same memory as pass-1 sets, typically far smaller: duplicates ≪ undetermined).
+- The Python exact path ships the full duplicate set back from workers and re-tests undetermined against it; we test the same way but the "set" is in-process u64s.
+- approx replaces `ExactSet` with `Bloom64` in pass 1; pass 2 membership tests become bloom queries; pass 3 tests `!bloom.contains(name0)`. False positives remove reads that should be kept (documented; `--fpr` controls it).
+- Threading: `--threads N` = rayon pool size (file-level parallelism). No fork, no managers, no global state. Gzip decode cost per file is the I/O floor; 4 lanes × 2 files already fills 8 cores at typical N.
+- Single-undetermined-lane + single-assigned-file (the common small case) still benefits: no process startup, no pickle, tighter inner loop.
+
+## 6. Hash & memory math
+
+### Hash choice: xxhash
+
+- `xxh64` for name0 identity: ~GB/s/core, 8 B output.
+- `xxh128` for the bloom: two independent 64-bit halves → k = 2 probe functions (classic optimal-k for m/n ≈ 19 bits/item is ~13; double-hashing with k=2 at 19 bits/item gives fpr ≈ (e^−19/... ) — **use the standard result**: with k=2 and m = 19.17·n bits, fpr ≈ 2^−(m/n)·... in practice compute empirically and size m with 20% margin; the test plan in §8 includes an empirical FPR check).
+- Why not sha256: 30–50× slower than xxhash and provides no benefit for non-adversarial cluster names (current code uses it only because `rbloom` needs *an* int hash and `pickle` was chosen for generality — it costs 0.53 µs/record).
+
+### 64-bit collision analysis (exact mode)
+
+Expected number of colliding name pairs: `n(n−1) / 2^65`
+
+| n (names) | 10 M | 100 M | 1 B |
+|---|---|---|---|
+| expected colliding pairs | 7×10⁻⁸ | 2.7×10⁻⁴ | 2.7×10⁻² |
+
+At 100 M names there is a 0.027% chance of *any* spurious duplicate in a run. Acceptable for "exact" in practice; if a user needs cryptographic identity, add an optional `--strict` mode that stores name0 strings (memory per §7 table) — do not build it speculatively.
+
+### Memory table (membership, pass-1 structure)
+
+| Structure | Per name | 10 M | 100 M | 1 B |
+|---|---|---|---|---|
+| Python `set[str]` (current exact) | ~90–120 B | ~1 GB | **~10–12 GB** | infeasible |
+| Python `rbloom` @ fpr 1e-4 (current approx, default 1e9 items) | 19.17 bits fixed | 24 MB | 240 MB | 2.4 GB |
+| Rust `HashSet<u64>` (hashbrown, load ~0.8) | ~16 B | 0.13 GB | **~2 GB** | ~16 GB |
+| Rust `Bloom64` @ fpr 1e-4 | 19.17 bits | 24 MB | **240 MB** | 2.4 GB |
+
+Bloom sizing formula (used in `Bloom64::new`): `m = ⌈n · (−ln fpr) / (ln 2)²⌉` bits → 19.17 bits/item at fpr = 1e-4; `k = 2` (xxh128 halves) with +20% bit margin, or derive k = round(m/n · ln 2) if we switch to more probe functions.
+
+Pass-3 `dups_L` sets: duplicates are a small fraction of undetermined in practice (that's the point of the tool); budget as a fraction of the pass-1 set, monitor in tests.
+
+## 7. CLI parity checklist
+
+Binary name: `fastq-purge` (or `fastq-purge-rs` during development). Flags mirror `parse_args()` (`main.py:42`) exactly:
+
+| Flag | Type | Default | Parity requirement |
+|---|---|---|---|
+| `--undetermined-path` | file or dir, required | — | dir → **non-recursive** glob `*.fq*` / `*.fastq*`; files whose names contain `purged` are excluded (re-run safety) |
+| `--assigned-path` | file/dir, `nargs+`, required | — | dir → **recursive** glob; dedupe; collapse paired/index files: if `re.sub(r"_[IR][0-9]_", "_", name)` was seen, skip with warning `Ignoring '<f>' as it is either a paired or index file`; lane key from `re.search(r"_L[0-9]{3}_", name)` → `L001`; files without it: warning + skip |
+| `--output-path` | dir | parent of first undetermined file | create if missing (`mkdir -p` semantics) |
+| `--method` | `exact` \| `approx` | `exact` | both must work (approx is currently broken) |
+| `--max-items` | int | `1_000_000_000` | approx only; used for bloom sizing — **recommend keeping the default** for parity but logging the actual item count observed |
+| `--fpr` | float | `1e-4` | approx only |
+| `--threading-method` | `loky` \| `mp_pool` \| `mp_manager` | `mp_pool` | **accept and ignore**, emit a one-time warning (parity for existing scripts) |
+| `--threads` | int | `1` | rayon pool size |
+| `--log-level` | DEBUG…CRITICAL | `INFO` | same levels, stderr, same message content where listed below |
+| `--version` | | | print version |
+
+Behavioural checklist (from `validate_args` + `main`):
+
+- [ ] Undetermined pairing: key = 3rd `_`-separated token of the filename (e.g. `L001` in `Undetermined_S0_L001_R1_001.fastq.gz`); files sorted; a lane with a single file → `(file, None)` and only that file is purged/written.
+- [ ] Output naming: `X.fastq.gz` → `X.purged.fastq.gz`; `X.fastq` → `X.purged.fastq`; written into `--output-path`.
+- [ ] exact logs (same strings, same order): `Using exact method`, `Building python set from undetermined reads...`, `Number of undetermined reads: {n} ({mb:.2f} MB)`, `Found {n} duplicates in the undetermined file.`, and when zero duplicates: `Found no duplicates in the undetermined reads. Exiting...` with **no output file created**.
+- [ ] approx logs: `Using bloom filter method`, `Building bloom filter...`, per-file `Processed {n} reads` every 1 M records, `Removed {n} reads`, `Kept {n} reads`, `Purged fastq file saved to '{path}'`.
+- [ ] Output gzip compression level 7.
+- [ ] Invalid path (neither file nor dir) → error log + exit code 1.
+- [ ] `--log-level` gates DEBUG-only lines (memory usage, bloom size, item counts).
+- [ ] Final `Done!` line.
+
+New (documented) behaviours:
+
+- [ ] `--purge-assigned` (D3): inverts direction; off by default.
+- [ ] approx + exact produce identical outputs except for bloom false positives (test-asserted on collision-free datasets).
+- [ ] Multi-undetermined-lane runs scan assigned files **once** (perf note, not an observable change except speed).
+
+## 8. Test & rollout plan
+
+**Differential testing (the gate)**
+
+1. Build a reference dataset where name0s are **globally unique** (fixes the synthetic-data caveat from profiling: the current generator's coordinate space is seed-invariant and produces birthday-collision name0s, which inflates exact-mode duplicate counts).
+2. Run Python exact (threads=1) and the Rust binary on the same set; compare purged outputs record-for-record (names + full records), byte-identical when compression settings match (else record-identical).
+3. Property tests: for approx, empirical FPR ≤ `--fpr` on a 10 M membership set + 10 M probes; duplicate count monotonic in `--max-items` sanity.
+
+**Edge cases (unit/integration)**
+
+- [ ] empty undetermined file; empty assigned dir (warning path)
+- [ ] zero duplicates → no output files, exact log string
+- [ ] all reads duplicated → empty (but existing) purged files
+- [ ] undetermined R2 missing (`(file, None)` path)
+- [ ] ungzipped `.fastq` input (output naming without `.gz`)
+- [ ] multi-lane (4 lanes × R1/R2) with cross-lane duplicates
+- [ ] assigned dir containing I1/I2 files (collapse + warning)
+- [ ] filenames without `_L00[0-9]{2}_` (warning + skip)
+- [ ] re-run with outputs present (purged files excluded from input discovery)
+
+**Performance acceptance (5 M synthetic set, 16 cores)**
+
+- [ ] exact end-to-end ≤ 3 s (vs 9.1 s Python)
+- [ ] approx end-to-end ≤ 5 s (vs 38.4 s Python)
+- [ ] 100 M-name membership ≤ 2.5 GB RSS (measured, documented)
+- [ ] ≥ 2× the Python wall time at ≥ 50 M reads
+
+**Rollout**
+
+1. Milestones: (M1) CLI + discovery/validation port; (M2) FASTQ streaming + name0 hashing; (M3) exact pipeline single-threaded; (M4) bloom pipeline; (M5) rayon + progress; (M6) differential + perf validation. ~5–7 working days total.
+2. Ship `fastq-purge-rs` side-by-side; keep the Python package for one release cycle; compare on a real run before declaring the Python version deprecated.
+3. Changelog must call out D1/D2/D3 and the fixed approx path.
+
+## 9. Risks & open questions
+
+- **R1 — semantic divergence (D1/D2):** existing users may depend on approx's old direction/key. Mitigation: differential tests, `--purge-assigned`, explicit changelog. *Owner: decide before M1.*
+- **R2 — name0 hash collisions (exact):** quantified in §6 (2.7×10⁻⁴ expected pairs at 100 M). Accept; optional `--strict` later.
+- **R3 — gzip stream assumptions:** multi-member gzip (Illumina sometimes concatenates members) — `flate2` handles it; add a test fixture. CRLF line endings are not expected; fail loudly if a line lacks `\n` (corrupt input) rather than guessing.
+- **R4 — output determinism:** keep writes strictly sequential per file so outputs are reproducible; only file-parallelism, never record-reordering.
+- **R5 — `--max-items` default (1e9) allocates a 2.4 GB bloom for a 10 M read run.** Keep for parity, but log `bloom sized for {max_items} items, observed {n}` and consider a default change next major.
+- **Open:** should pass 2 count duplicates per lane (for the `Found {n} duplicates` log) or return the set only? Counts are needed for parity logging — keep counts (cheap: one u64 per lane).
