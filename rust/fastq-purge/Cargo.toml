@@ -1,0 +1,17 @@
+[package]
+name = "fastq-purge"
+version = "0.3.0"
+edition = "2021"
+description = "Purge FASTQ files of reads already present in assigned files (Rust rewrite, see RUST_REWRITE.md)"
+license = "MIT"
+
+[[bin]]
+name = "fastq-purge-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = true

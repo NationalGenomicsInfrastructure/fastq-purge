@@ -85,7 +85,7 @@ fastq-purge/
         └── pipeline.rs    # passes, rayon orchestration, progress reporting
 ```
 
-Dependencies: `clap` (derive), `flate2` (miniz_oxide backend; multi-member aware), `rayon`, `xxhash-rust`, `bitvec`, `thiserror`/`anyhow`, `tracing` + `tracing-subscriber` (stderr, plain format), `indicatif` optional (only if we relax log-format parity).
+Dependencies: `clap` (derive), `flate2` (miniz_oxide backend; multi-member aware), `rayon`, `xxhash-rust`, `bitvec`, `thiserror`/`anyhow`, `indicatif` optional (only if we relax log-format parity). M1 uses a ~70-line minimal level-gated logger instead of `tracing` (added only if M3/M4 need structured logging).
 
 ### Key data structures
 
@@ -200,9 +200,9 @@ Binary name: `fastq-purge` (or `fastq-purge-rs` during development). Flags mirro
 | `--method` | `exact` \| `approx` | `exact` | both must work (approx is currently broken) |
 | `--max-items` | int | `1_000_000_000` | approx only; used for bloom sizing — **recommend keeping the default** for parity but logging the actual item count observed |
 | `--fpr` | float | `1e-4` | approx only |
-| `--threading-method` | `loky` \| `mp_pool` \| `mp_manager` | `mp_pool` | **accept and ignore**, emit a one-time warning (parity for existing scripts) |
+| `--threading-method` | `loky` \| `mp_pool` \| `mp_manager` | `mp_pool` | **accept and ignore**; one-time "accepted and ignored" warning in the pipeline phase (NOT in the validation block, to keep the validation log byte-identical to Python) |
 | `--threads` | int | `1` | rayon pool size |
-| `--log-level` | DEBUG…CRITICAL | `INFO` | same levels, stderr, same message content where listed below |
+| `--log-level` | DEBUG…CRITICAL | `INFO` | same levels; same message content and order on **stdout** (see logging note below) |
 | `--version` | | | print version |
 
 Behavioural checklist (from `validate_args` + `main`):
@@ -216,6 +216,10 @@ Behavioural checklist (from `validate_args` + `main`):
 - [ ] `--log-level` gates DEBUG-only lines (memory usage, bloom size, item counts).
 - [ ] Final `Done!` line.
 
+**Logging contract (verified against the running Python CLI, 2026-11-05)**
+
+The Python CLI configures `RichHandler(rich_tracebacks=True, tracebacks_show_locals=True, markup=True)` — despite `format="%(message)s"` in `basicConfig`, RichHandler renders each record itself: **stdout**, layout `HH:MM:SS LEVEL message  main.py:LINE`, level column fixed width, rich wrapping at console width, timestamp omitted when the second is unchanged, colour when TTY. The Rust CLI reproduces the *message* contract — identical messages, identical order, identical `--log-level` gating, on stdout — as plain bare lines. Deliberate deviation: no rich rendering (wall-clock timestamps are non-deterministic, `main.py:LINE` references Python source that does not exist in the rewrite, wrapping depends on console width). "Path … is neither a file nor a directory" is logged to stdout once before exit 1 (parity); errors with no Python equivalent (clean error for an empty undetermined dir, M1 pipeline bail) go to stderr.
+
 New (documented) behaviours:
 
 - [ ] `--purge-assigned` (D3): inverts direction; off by default.
@@ -223,6 +227,11 @@ New (documented) behaviours:
 - [ ] Multi-undetermined-lane runs scan assigned files **once** (perf note, not an observable change except speed).
 
 ## 8. Test & rollout plan
+
+### Milestone status
+
+- [x] **M1 — CLI + discovery/validation (done 2026-11-05).** Rust workspace at `rust/fastq-purge/` (bin `fastq-purge-rs`, v0.3.0): clap CLI with all flags/defaults/choices; `validate_args` port (undetermined pairing, output naming/dir creation, assigned cleaning + lane grouping); fnmatch port for `pathlib.glob` single-component patterns. 17 unit tests (`cargo test`). Differential validation-log parity vs the Python CLI on the 5 M dataset: **byte-identical message blocks** for (a) single-lane gz run, (b) two-lane run exposing the stale-`lane` log quirk, (c) ungzipped `.fastq` single-read lane (`'None'` lines), (d) re-run with `.purged.*` outputs present (excluded); `--version` rc 0; usage errors rc 2 (both); invalid path → message on stdout + rc 1 (both, no duplicate print); DEBUG-only output-dir line gated identically. Deviations: empty undetermined dir → clean stderr error + rc 1 (Python: IndexError traceback); `--version` prints `fastq-purge-rs 0.3.0` (name/version differ by design); plain log rendering (see §7 note).
+  - Findings: the `Assigned files:` per-file log reuses the last undetermined-lane loop variable (main.py:299) — reproduced for parity. `_R1_`/`_R2_` normalisation replaces each segment with the *literal* text `_R[12]_`, which is then re-globbed as an fnmatch class. `re.sub` consumes each matched `_[IR][0-9]_`/`_R[12]_` segment including its trailing underscore, so adjacent segments sharing an underscore are NOT both collapsed/normalised (`_R1_R2_` → `_R2_`/`R[12]_R2_`). The glob patterns `*.fq*` and `*.fastq*` are disjoint (`.fastq` does not contain the substring `.fq`); a name like `x.fq.fastq.gz` matches both and appears twice in `explode_path` output (no dedup — dedup happens downstream). Rust 1.99 removed `impl Display for PathBuf` (use `.display()`).
 
 **Differential testing (the gate)**
 
