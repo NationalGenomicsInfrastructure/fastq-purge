@@ -181,3 +181,97 @@ fn gzipped_end_to_end() {
     std::io::Read::read_to_string(&mut dec, &mut got).unwrap();
     assert_eq!(got, "@a 1:N:0\nACGT\n+\nIIII\n@c 1:N:0\nACGT\n+\nIIII\n");
 }
+
+// ---- milestone M4: the approx (bloom) pipeline -------------------------
+
+/// The D4 guarantee (RUST_REWRITE.md §8/M4): for any `--fpr` the purged
+/// outputs are identical to the exact method's; only the `Found {K}`
+/// count may differ (by the number of structural false positives).
+#[test]
+fn approx_matches_exact_output() {
+    let d = tmpdir("approx_exact");
+    setup(&d, &["b", "x", "d"], true);
+    let exact_out = run(&d, &[]);
+
+    // snapshot the exact purged outputs, then clear the out dir
+    let p1 = d.join("out/Undetermined_S0_L001_R1_001.purged.fastq");
+    let p2 = d.join("out/Undetermined_S0_L001_R2_001.purged.fastq");
+    let exact_files = (std::fs::read(&p1).unwrap(), std::fs::read(&p2).unwrap());
+    std::fs::remove_dir_all(d.join("out")).unwrap();
+    std::fs::create_dir_all(d.join("out")).unwrap();
+
+    let approx_out = run(
+        &d,
+        &[
+            "--method",
+            "approx",
+            "--max-items",
+            "100000",
+            "--fpr",
+            "0.01",
+        ],
+    );
+    assert!(approx_out.contains("Using bloom filter method"));
+    assert!(approx_out.contains("Building bloom filter..."));
+    assert!(approx_out.contains("Scanning assigned files for already-assigned reads..."));
+
+    // same Removed/Kept counts as the exact run
+    for line in ["    Removed 2 reads", "    Kept 2 reads", "Done!"] {
+        assert!(approx_out.contains(line), "missing {line:?}\n{approx_out}");
+        assert!(exact_out.contains(line), "missing {line:?}\n{exact_out}");
+    }
+
+    // byte-identical purged outputs (the D4 guarantee)
+    assert_eq!(std::fs::read(&p1).unwrap(), exact_files.0);
+    assert_eq!(std::fs::read(&p2).unwrap(), exact_files.1);
+}
+
+#[test]
+fn approx_no_duplicates_writes_nothing() {
+    let d = tmpdir("approx_nodups");
+    setup(&d, &["z", "y"], true);
+    let stdout = run(
+        &d,
+        &[
+            "--method",
+            "approx",
+            "--max-items",
+            "100000",
+            "--fpr",
+            "0.01",
+        ],
+    );
+    assert!(stdout.contains("Found 0 duplicates in the undetermined file."));
+    assert!(stdout.contains("Found no duplicates in the undetermined reads. Exiting..."));
+    assert!(stdout.contains("Done!"));
+    assert_eq!(std::fs::read_dir(d.join("out")).unwrap().count(), 0);
+}
+
+#[test]
+fn approx_purge_assigned_flag() {
+    let d = tmpdir("approx_purgeassigned");
+    setup(&d, &["b", "x", "d"], true);
+    let stdout = run(
+        &d,
+        &[
+            "--method",
+            "approx",
+            "--max-items",
+            "100000",
+            "--fpr",
+            "0.01",
+            "--purge-assigned",
+        ],
+    );
+    assert!(stdout.contains("Purging assigned files..."));
+    assert!(stdout.contains("    Removed 2 reads"));
+    assert!(stdout.contains("    Kept 1 reads"));
+    let pa = d.join("out/S1_L001_R1_001.purged.fastq");
+    assert_eq!(
+        std::fs::read_to_string(&pa).unwrap(),
+        "@x 1:N:0\nACGT\n+\nIIII\n"
+    );
+    assert!(!d
+        .join("out/Undetermined_S0_L001_R1_001.purged.fastq")
+        .exists());
+}

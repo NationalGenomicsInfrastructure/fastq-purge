@@ -121,6 +121,7 @@ pub fn run(config: &AppConfig) -> anyhow::Result<()> {
             out2.as_deref(),
             &dups[l],
             &config.log,
+            false,
         )?;
     }
 
@@ -189,16 +190,22 @@ fn purge_assigned(config: &AppConfig, sets: &[ExactSet]) -> anyhow::Result<()> {
 
 /// Write the purged undetermined file(s) of one lane (the default D1
 /// direction). Paired inputs are zipped: iteration stops at the shorter
-/// of R1/R2 (Python `dnaio` paired iteration is a zip).
-fn write_purged_undetermined(
+/// of R1/R2 (Python `dnaio` paired iteration is a zip). `progress`
+/// emits the per-1M `    Processed {n} reads` line (the approx method's
+/// contract; the exact method does not print it — Python's exact path
+/// doesn't either). Shared by the exact and approx pipelines (M4: the
+/// dups set is exact in both — decision D4).
+pub(crate) fn write_purged_undetermined(
     r1: &Path,
     r2: Option<&Path>,
     out1: &Path,
     out2: Option<&Path>,
     dups: &ExactSet,
     log: &crate::logging::Logger,
+    progress: bool,
 ) -> anyhow::Result<()> {
     let (mut kept, mut removed) = (0u64, 0u64);
+    let mut seen = 0u64;
 
     match (r2, out2) {
         (Some(r2), Some(out2)) => {
@@ -217,6 +224,10 @@ fn write_purged_undetermined(
                     break;
                 };
                 let rec2 = rec2?;
+                seen += 1;
+                if progress && seen.is_multiple_of(1_000_000) {
+                    log.info(&format!("    Processed {seen} reads"));
+                }
                 if dups.contains_name(rec1.name0()) {
                     removed += 1;
                 } else {
@@ -232,6 +243,10 @@ fn write_purged_undetermined(
             let mut writer = FastqWriter::create(out1)?;
             while let Some(rec) = reader.next_record() {
                 let rec = rec?;
+                seen += 1;
+                if progress && seen.is_multiple_of(1_000_000) {
+                    log.info(&format!("    Processed {seen} reads"));
+                }
                 if dups.contains_name(rec.name0()) {
                     removed += 1;
                 } else {
@@ -257,7 +272,7 @@ fn write_purged_undetermined(
 
 /// `file_name` that renders as the empty string rather than erroring on
 /// paths without a file name (defensive; discovery always yields files).
-fn file_name(p: &Path) -> String {
+pub(crate) fn file_name(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
