@@ -9,9 +9,15 @@ license = "MIT"
 name = "fastq-purge-rs"
 path = "src/main.rs"
 
+[[bin]]
+name = "fastq-dump"
+path = "src/bin/fastq-dump.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 [profile.release]
 lto = true
