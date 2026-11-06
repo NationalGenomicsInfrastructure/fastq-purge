@@ -17,6 +17,7 @@ path = "src/bin/fastq-dump.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
+rayon = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 [profile.release]

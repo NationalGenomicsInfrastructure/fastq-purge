@@ -132,9 +132,12 @@ pub struct FastqReader<R: Read> {
     end: usize,
     /// Number of physical lines fully consumed so far.
     line_no: u64,
-    /// Raw bytes of the current record attempt (with terminators as they
-    /// appear in the stream), for the incomplete-record quote.
-    rec: Vec<u8>,
+    /// Start offset of the current record attempt in `buf`, set at the
+    /// record boundary (right after the header read — the only point at
+    /// which a repack may have shifted the buffer). The bytes
+    /// `buf[rec_start..start)` are the record's consumed bytes so far,
+    /// terminators as in the stream — the incomplete-record quote.
+    rec_start: usize,
 }
 
 impl<R: Read> FastqReader<R> {
@@ -145,7 +148,7 @@ impl<R: Read> FastqReader<R> {
             start: 0,
             end: 0,
             line_no: 0,
-            rec: Vec::new(),
+            rec_start: 0,
         }
     }
 
@@ -159,11 +162,23 @@ impl<R: Read> FastqReader<R> {
     /// records, never while a record's earlier line spans are still in
     /// use. Growth via `reserve` is fine at any point (no shift).
     fn read_line(&mut self, allow_repack: bool) -> Result<Option<Line>, FastqError> {
+        let mut non_ascii = false;
         loop {
-            if let Some(rel) = self.buf[self.start..self.end]
-                .iter()
-                .position(|b| *b == b'\n')
-            {
+            // One scan does double duty (M5): find the line's `\n` and
+            // flag any non-ASCII byte in it (reported when the line
+            // completes — exactly when the old separate `ascii_check`
+            // ran, preserving the verified error priorities).
+            let mut nl: Option<usize> = None;
+            for (i, b) in self.buf[self.start..self.end].iter().enumerate() {
+                if *b >= 0x80 {
+                    non_ascii = true;
+                }
+                if *b == b'\n' {
+                    nl = Some(i);
+                    break;
+                }
+            }
+            if let Some(rel) = nl {
                 let nl = self.start + rel;
                 let mut line = Line {
                     no: self.line_no + 1,
@@ -175,9 +190,11 @@ impl<R: Read> FastqReader<R> {
                     content_end -= 1;
                 }
                 line.end = content_end;
-                self.rec.extend_from_slice(&self.buf[line.start..nl + 1]);
                 self.start = nl + 1;
                 self.line_no = line.no;
+                if non_ascii {
+                    return Err(Self::non_ascii_error());
+                }
                 return Ok(Some(line));
             }
             // No newline in the buffered data: refill.
@@ -205,9 +222,11 @@ impl<R: Read> FastqReader<R> {
                     if line.end > line.start && self.buf[line.end - 1] == b'\r' {
                         line.end -= 1;
                     }
-                    self.rec.extend_from_slice(&self.buf[line.start..]);
                     self.start = self.end;
                     self.line_no = line.no;
+                    if non_ascii {
+                        return Err(Self::non_ascii_error());
+                    }
                     return Ok(Some(line));
                 }
                 return Ok(None);
@@ -215,8 +234,10 @@ impl<R: Read> FastqReader<R> {
         }
     }
 
-    fn line_bytes(&self, line: &Line) -> &[u8] {
-        &self.buf[line.start..line.end]
+    /// The non-ASCII error (dnaio aborts at the offending line, reported
+    /// at "unknown line").
+    fn non_ascii_error() -> FastqError {
+        format_error(None, "Non-ASCII characters found in record.".to_string())
     }
 
     /// The `found '{c}'` character for a structural error on `line`: the
@@ -230,26 +251,16 @@ impl<R: Read> FastqReader<R> {
         }
     }
 
-    /// Check one line for non-ASCII bytes (dnaio aborts as soon as the
-    /// offending line is read, reported at "unknown line").
-    fn ascii_check(&self, line: &Line) -> Result<(), FastqError> {
-        if self.line_bytes(line).iter().any(|b| *b >= 0x80) {
-            return Err(format_error(
-                None,
-                "Non-ASCII characters found in record.".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
     /// The premature-EOF error: the next physical line number plus the raw
-    /// bytes of the incomplete record attempt so far, Python-repr quoted.
+    /// bytes of the incomplete record attempt so far, Python-repr quoted
+    /// (M5: quoted lazily from the buffer via `rec_start` — no per-line
+    /// copy).
     fn premature_eof(&self) -> FastqError {
         format_error(
             Some(self.line_no + 1),
             format!(
                 "Premature end of file encountered. The incomplete final record was: {}",
-                py_quote(&self.rec)
+                py_quote(&self.buf[self.rec_start..self.start])
             ),
         )
     }
@@ -257,16 +268,18 @@ impl<R: Read> FastqReader<R> {
     /// Parse one full record. Returns the line spans; `None` at clean EOF
     /// before a new record started.
     ///
-    /// Check order matches the C parser (empirically verified):
-    /// 1. header read -> ASCII check (the `@` check is DEFERRED)
-    /// 2. seq read (EOF -> premature) -> ASCII check
+    /// Check order matches the C parser (empirically verified). The ASCII
+    /// check runs inside `read_line` the moment a line completes (M5:
+    /// fused into the newline scan) — same priority as the old separate
+    /// check after each read:
+    /// 1. header read -> ASCII (the `@` check is DEFERRED)
+    /// 2. seq read (EOF -> premature) -> ASCII
     /// 3. header must start with `@` or `>` (error at the header line)
-    /// 4. plus line read (EOF -> premature) -> ASCII check
+    /// 4. plus line read (EOF -> premature) -> ASCII
     /// 5. plus line must start with `+` (error at the plus line)
-    /// 6. qual read (EOF -> premature) -> ASCII check
+    /// 6. qual read (EOF -> premature) -> ASCII
     /// 7. seq/qual lengths must match (error at the qual line)
     fn parse_record(&mut self) -> Result<Option<(Line, Line, Line)>, FastqError> {
-        self.rec.clear();
         // Repacking (buffer shift) is allowed only here, at the record
         // boundary: no earlier line spans are in use. Every later line
         // read must not shift the buffer, because the header/sequence
@@ -274,11 +287,13 @@ impl<R: Read> FastqReader<R> {
         let Some(hdr) = self.read_line(true)? else {
             return Ok(None);
         };
-        self.ascii_check(&hdr)?;
+        // Set the quote start after the (possibly re-packed) header
+        // read: `buf[rec_start..start)` then accumulates exactly this
+        // record's consumed bytes, terminators included.
+        self.rec_start = hdr.start;
         let Some(seq) = self.read_line(false)? else {
             return Err(self.premature_eof());
         };
-        self.ascii_check(&seq)?;
         let hfirst_ok =
             hdr.start < hdr.end && (self.buf[hdr.start] == b'@' || self.buf[hdr.start] == b'>');
         if !hfirst_ok {
@@ -293,7 +308,6 @@ impl<R: Read> FastqReader<R> {
         let Some(plus) = self.read_line(false)? else {
             return Err(self.premature_eof());
         };
-        self.ascii_check(&plus)?;
         if plus.start == plus.end || self.buf[plus.start] != b'+' {
             return Err(format_error(
                 Some(plus.no),
@@ -306,7 +320,6 @@ impl<R: Read> FastqReader<R> {
         let Some(qual) = self.read_line(false)? else {
             return Err(self.premature_eof());
         };
-        self.ascii_check(&qual)?;
         if (seq.end - seq.start) != (qual.end - qual.start) {
             return Err(format_error(
                 Some(qual.no),

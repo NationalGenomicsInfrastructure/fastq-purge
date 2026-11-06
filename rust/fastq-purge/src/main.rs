@@ -8,13 +8,24 @@ use clap::Parser;
 fn main() {
     let cli = fastq_purge::cli::Cli::parse();
     match fastq_purge::cli::validate(cli) {
-        Ok(config) => match fastq_purge::pipeline::run(&config) {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!("{e}");
+        Ok(config) => {
+            // M5: the pipeline passes run on the global rayon pool,
+            // sized by --threads (RUST_REWRITE.md §5).
+            if let Err(e) = rayon::ThreadPoolBuilder::new()
+                .num_threads(config.threads.max(1) as usize)
+                .build_global()
+            {
+                eprintln!("failed to build the thread pool: {e}");
                 std::process::exit(1);
             }
-        },
+            match fastq_purge::pipeline::run(&config) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Err((msg, code, already_logged)) => {
             if !already_logged {
                 eprintln!("{msg}");

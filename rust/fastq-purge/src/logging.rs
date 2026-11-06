@@ -56,6 +56,13 @@ impl Logger {
         }
     }
 
+    /// Emit a line at an explicit level (the M5 deterministic-log rule:
+    /// pass workers collect their lines and the orchestrator flushes them
+    /// in canonical order — see `pipeline::Lines`).
+    pub(crate) fn emit(&self, level: Level, msg: &str) {
+        self.log(level, msg);
+    }
+
     pub fn debug(&self, msg: &str) {
         self.log(Level::Debug, msg);
     }

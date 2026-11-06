@@ -275,3 +275,140 @@ fn approx_purge_assigned_flag() {
         .join("out/Undetermined_S0_L001_R1_001.purged.fastq")
         .exists());
 }
+
+// ---- milestone M5: rayon -----------------------------------------------
+
+/// Pass 2 tests every assigned name0 against ALL lane sets: a name from
+/// lane L001's assigned file that belongs to lane L002's undetermined
+/// set counts as a duplicate for L002.
+#[test]
+fn two_lanes_cross_lane_dups() {
+    let d = tmpdir("twolane");
+    std::fs::create_dir_all(d.join("und")).unwrap();
+    std::fs::create_dir_all(d.join("assigned")).unwrap();
+    std::fs::create_dir_all(d.join("out")).unwrap();
+    write_fastq(
+        &d.join("und/Undetermined_S0_L001_R1_001.fastq"),
+        &["a", "b", "c", "d"],
+    );
+    write_fastq(
+        &d.join("und/Undetermined_S0_L002_R1_001.fastq"),
+        &["w", "x", "y", "z"],
+    );
+    // b -> L001's dups; x -> L002's dups (cross-lane, from L001's file)
+    write_fastq(&d.join("assigned/S1_L001_R1_001.fastq"), &["b", "x"]);
+    write_fastq(&d.join("assigned/S1_L002_R1_001.fastq"), &["y"]);
+
+    let stdout = run(&d, &[]);
+    assert!(stdout.contains("Found 1 duplicates in the undetermined file."));
+    assert!(stdout.contains("Found 2 duplicates in the undetermined file."));
+    // canonical lane order: L001's Found line before L002's
+    let p1 = stdout.find("Found 1 duplicates").unwrap();
+    let p2 = stdout.find("Found 2 duplicates").unwrap();
+    assert!(p1 < p2, "lane order violated:\n{stdout}");
+
+    assert_eq!(
+        std::fs::read_to_string(d.join("out/Undetermined_S0_L001_R1_001.purged.fastq")).unwrap(),
+        "@a 1:N:0\nACGT\n+\nIIII\n@c 1:N:0\nACGT\n+\nIIII\n@d 1:N:0\nACGT\n+\nIIII\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(d.join("out/Undetermined_S0_L002_R1_001.purged.fastq")).unwrap(),
+        "@w 1:N:0\nACGT\n+\nIIII\n@z 1:N:0\nACGT\n+\nIIII\n"
+    );
+}
+
+/// The M5 deterministic-log rule: `--threads N` must produce a byte-
+/// identical log AND byte-identical purged outputs vs the sequential
+/// run, for both methods (on a two-lane paired dataset so the pass-3
+/// zip is exercised).
+#[test]
+fn parallel_matches_sequential_log_and_output() {
+    for (tag, method) in [
+        ("exact", Vec::<&str>::new()),
+        (
+            "approx",
+            vec![
+                "--method",
+                "approx",
+                "--max-items",
+                "100000",
+                "--fpr",
+                "0.01",
+            ],
+        ),
+    ] {
+        let d = tmpdir(&format!("par_{tag}"));
+        std::fs::create_dir_all(d.join("und")).unwrap();
+        std::fs::create_dir_all(d.join("assigned")).unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        for (l, names1) in [
+            ("L001", &["a", "b", "c", "d"][..]),
+            ("L002", &["w", "x", "y", "z"][..]),
+        ] {
+            write_fastq(
+                &d.join(format!("und/Undetermined_S0_{l}_R1_001.fastq")),
+                names1,
+            );
+            let names2: Vec<String> = names1.iter().map(|n| format!("p{n}")).collect();
+            write_fastq(
+                &d.join(format!("und/Undetermined_S0_{l}_R2_001.fastq")),
+                &names2.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            );
+        }
+        write_fastq(&d.join("assigned/S1_L001_R1_001.fastq"), &["b", "x"]);
+        write_fastq(&d.join("assigned/S1_L002_R1_001.fastq"), &["y"]);
+
+        let seq = run(&d, &method);
+        let snapshot: Vec<(String, Vec<u8>)> = std::fs::read_dir(d.join("out"))
+            .unwrap()
+            .map(|e| e.unwrap())
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect();
+        std::fs::remove_dir_all(d.join("out")).unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+
+        let mut par_args = method.clone();
+        par_args.extend_from_slice(&["--threads", "4"]);
+        let par = run(&d, &par_args);
+
+        assert_eq!(par, seq, "log must be byte-identical ({tag})");
+        let after: Vec<(String, Vec<u8>)> = std::fs::read_dir(d.join("out"))
+            .unwrap()
+            .map(|e| e.unwrap())
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(after, snapshot, "purged outputs must be identical ({tag})");
+    }
+}
+
+/// `--threads` is now honoured (no warning); the one-time warning fires
+/// only for a non-default `--threading-method` (M5 wording, §7).
+#[test]
+fn threading_warning_only_for_non_default_method() {
+    let d = tmpdir("threadwarn");
+    setup(&d, &["z"], false);
+    let no_warn = run(&d, &["--threads", "4"]);
+    assert!(
+        !no_warn.contains("accepted and ignored"),
+        "--threads alone must not warn:\n{no_warn}"
+    );
+    let warned = run(&d, &["--threading-method", "loky"]);
+    assert!(
+        warned.contains(
+            "'--threading-method loky' accepted and ignored (the Rust \
+             implementation is thread-based; '--threads 1' sets the pool \
+             size)"
+        ),
+        "missing the M5 warning:\n{warned}"
+    );
+}

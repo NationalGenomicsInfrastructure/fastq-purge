@@ -61,6 +61,21 @@ impl ExactSet {
         self.inner.len() * 16
     }
 
+    /// Insert every hash of `other` into `self`, returning how many were
+    /// newly added. Used by the M5 pass-2 merge to reproduce the
+    /// sequential run's per-file "new duplicates" count exactly
+    /// (within-file duplicates dedupe to one; across files the earlier
+    /// file's copy wins, matching stream-order insert-returns-bool).
+    pub fn merge(&mut self, other: ExactSet) -> usize {
+        let mut n = 0usize;
+        for h in other.inner {
+            if self.inner.insert(h) {
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub fn len(&self) -> usize {
         self.inner.len()
     }
