@@ -9,6 +9,12 @@ use std::collections::HashSet;
 
 use xxhash_rust::xxh64::xxh64;
 
+/// The identity hash for a name0 (seed 0). One 64-bit hash; the collision
+/// probability is quantified in RUST_REWRITE.md §6 (risk R2, accepted).
+pub fn hash_name0(name0: &[u8]) -> u64 {
+    xxh64(name0, 0)
+}
+
 pub struct ExactSet {
     inner: HashSet<u64>,
 }
@@ -28,12 +34,31 @@ impl ExactSet {
 
     /// Insert the hash of a name0.
     pub fn insert_name(&mut self, name0: &[u8]) {
-        self.inner.insert(xxh64(name0, 0));
+        self.insert_hash(hash_name0(name0));
     }
 
     /// True if the name0 was inserted.
     pub fn contains_name(&self, name0: &[u8]) -> bool {
-        self.inner.contains(&xxh64(name0, 0))
+        self.contains_hash(hash_name0(name0))
+    }
+
+    /// Insert a precomputed hash. Returns true if it was newly inserted.
+    pub fn insert_hash(&mut self, h: u64) -> bool {
+        self.inner.insert(h)
+    }
+
+    /// Membership test on a precomputed hash (avoids re-hashing when one
+    /// name0 is tested against several sets).
+    pub fn contains_hash(&self, h: u64) -> bool {
+        self.inner.contains(&h)
+    }
+
+    /// Rough size in bytes (hashbrown `u64` entry at the default load
+    /// factor ≈ 16 B/entry). Diagnostic only — the Python log line this
+    /// mirrors reports `sys.getsizeof` of a Python `set`, a different
+    /// quantity.
+    pub fn estimated_bytes(&self) -> usize {
+        self.inner.len() * 16
     }
 
     pub fn len(&self) -> usize {

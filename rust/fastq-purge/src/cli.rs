@@ -129,6 +129,15 @@ pub struct Cli {
     /// Set the logging level
     #[arg(long, value_enum, default_value_t = LogLevel::Info)]
     pub log_level: LogLevel,
+
+    /// Purge the assigned files instead of the undetermined ones.
+    ///
+    /// Canonical direction (default): undetermined reads whose name
+    /// appears in any assigned file are removed (RUST_REWRITE.md D1).
+    /// This flag inverts that for anyone relying on the old approx
+    /// direction (D3).
+    #[arg(long, default_value_t = false)]
+    pub purge_assigned: bool,
 }
 
 /// Validated, ready-to-run configuration (mirrors the Python
@@ -153,6 +162,9 @@ pub struct AppConfig {
     pub fpr: f64,
     pub threads: u64,
     pub threading_method: ThreadingMethod,
+    /// D3: invert the canonical purge direction (purge assigned instead of
+    /// undetermined).
+    pub purge_assigned: bool,
 }
 
 /// Validate `Cli` into an `AppConfig`, emitting the same log lines (same
@@ -294,5 +306,6 @@ pub fn validate(cli: Cli) -> Result<AppConfig, (String, i32, bool)> {
         fpr: cli.fpr,
         threads: cli.threads,
         threading_method: cli.threading_method,
+        purge_assigned: cli.purge_assigned,
     })
 }
