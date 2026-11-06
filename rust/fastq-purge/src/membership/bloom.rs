@@ -201,4 +201,71 @@ mod tests {
             "measured FPR {measured:.6} exceeds target {target}"
         );
     }
+
+    #[test]
+    fn empirical_fpr_within_target_10m() {
+        // §8 gate property test: a 10 M membership set probed by 10 M
+        // non-members; measured FPR must be ≤ --fpr. (The 20% size margin
+        // makes the achieved FPR ~5× better than the target, so this is
+        // not statistically knife-edge.)
+        let n = 10_000_000u64;
+        let target = 1e-4;
+        let mut b = Bloom64::new(n, target);
+        let mut name = [0u8; 16];
+        for i in 0..n {
+            name[..8].copy_from_slice(&i.to_le_bytes());
+            name[8] = b'M';
+            b.insert_name(&name);
+        }
+        let mut fp = 0u64;
+        for i in 0..n {
+            name[..8].copy_from_slice(&i.to_le_bytes());
+            name[8] = b'N';
+            if b.contains_name(&name) {
+                fp += 1;
+            }
+        }
+        let measured = fp as f64 / n as f64;
+        assert!(
+            measured <= target,
+            "measured FPR {measured:.6} exceeds target {target}"
+        );
+    }
+
+    #[test]
+    fn saturation_increases_found_count() {
+        // §8 gate sanity: the duplicate count is monotonic in
+        // --max-items — a smaller capacity (more saturated bloom, higher
+        // structural FPR) flags at least as many non-members. Here the
+        // gap is not knife-edge: the saturated bloom (1000 items, fpr
+        // 0.5 → 1732 bits, k = 1) is fully set after 100k insertions
+        // (FPR ≈ 1), the comfortable one (100k items, fpr 1e-4) has an
+        // expected ~2 false positives among 100k probes.
+        let n = 100_000u64;
+        let mut c = Bloom64::new(n, 1e-4);
+        let mut s = Bloom64::new(1_000, 0.5);
+        let mut name = [0u8; 16];
+        for i in 0..n {
+            name[..8].copy_from_slice(&i.to_le_bytes());
+            name[8] = b'M';
+            c.insert_name(&name);
+            s.insert_name(&name);
+        }
+        let (mut comfy_fp, mut sat_fp) = (0u64, 0u64);
+        for i in 0..n {
+            name[..8].copy_from_slice(&i.to_le_bytes());
+            name[8] = b'N';
+            if c.contains_name(&name) {
+                comfy_fp += 1;
+            }
+            if s.contains_name(&name) {
+                sat_fp += 1;
+            }
+        }
+        assert!(
+            sat_fp > comfy_fp,
+            "saturated bloom flagged {sat_fp}, comfortable {comfy_fp} — \
+             monotonicity in --max-items violated"
+        );
+    }
 }

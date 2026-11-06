@@ -265,6 +265,14 @@ New (documented) behaviours:
   - Tests: +3 e2e (`two_lanes_cross_lane_dups` — pass 2 tests every assigned name0 against **all** lane sets, so a name from L001's assigned file that is in L002's undetermined set is an L002 duplicate; `parallel_matches_sequential_log_and_output` — `--threads 4` vs default produce **byte-identical stdout and purged outputs** for both methods on a two-lane paired dataset; `threading_warning_only_for_non_default_method`). 65 tests total (25 unit + 29 fastq + 11 pipeline); clippy clean.
   - Performance (release, 16-core machine): **5 M single-lane** (the profiling set): 17.08 s @ `--threads 16` — one file per pass, so no parallelism is possible and the §2 non-goal (no intra-stream parallel decompression) makes the single-stream inflate the floor. **4-lane dataset** (1.1 M und × 4 lanes + 5 M assigned × 4 lanes): **12.05 s @ `--threads 16` (334 % CPU) vs 34.58 s @ `--threads 1` → 2.87×**; parallelism = max(lanes, assigned files) per pass, capped by `--threads` (16 threads, 4 items ⇒ ≤ 4 cores busy per pass). Correctness: all 8 purged outputs (4 lanes × R1/R2) **byte-identical after decompression** across `--threads 16` / `--threads 1` / the M3 single-lane reference. Wall analysis: the §8 acceptance targets (exact ≤ 3 s, approx ≤ 5 s on the 5 M set) assume multi-lane/multi-file workloads; they are unreachable for a single-lane single-file run, where the 312 MB assigned-file inflate (~5.7 s) plus two 62 MB undetermined inflates set the floor regardless of thread count.
 
+- [x] **M6 — differential + perf validation (done 2026-11-06).** All gate items green:
+  - **Collision-free reference differential** (gate steps 1+2): dataset with 1 M records/lane, **globally unique** name0s `UND%07d` (matching R1/R2 pair names), assigned = 400 k overlapping `UND%07d` + 600 k unique `ASS%07d` (150 bp). Python exact (`--threads 1`) vs Rust exact: counts identical (`Number of undetermined reads: 1000000`, `Found 400000 duplicates`); purged R1+R2 **byte-identical after decompression** (600 k records each; the first 400 k overlap names correctly removed).
+  - **Property tests** (gate step 3): +2 committed unit tests in `membership/bloom.rs` — `empirical_fpr_within_target_10m` (10 M inserts / 10 M non-member probes, measured FPR ≤ `--fpr` 1e-4) and `saturation_increases_found_count` (saturated 1,732-bit bloom ⇒ FPR ≈ 1 vs ≈ 2 FPs comfy — the monotonic-in-`--max-items` mechanism). Binary-level check on the reference dataset: `--max-items 1000000` → `Found 400008` (400000 true + 8 structural FPs); `--max-items 1000 --fpr 0.5` → `Found 1000000` (saturated); **both** `Removed 400000` / `Kept 600000`, purged outputs byte-identical to each other **and** to the exact-mode reference — the D4 guarantee at the binary level.
+  - **+2 e2e edge tests**: `all_duplicated_writes_empty_purged_files` (purged file exists, 0 bytes) and `empty_undetermined_file_runs_clean` (clean run, zero outputs). 69 tests total (27 unit + 29 fastq + 13 pipeline); fmt + clippy clean.
+  - **Memory acceptance — MET**: `examples/mem_100m.rs` (release): ExactSet 100 M unique name0s ⇒ **RSS 1.13 GB**; Bloom64(1e8, 1e-4) ⇒ m = 2,300,414,011 bits, k = 16 ⇒ **RSS 0.27 GB** — both far under 2.5 GB. Same-day Python `set[str]` 100 M ⇒ ≈ 13.2 GB peak RSS (~12× the Rust exact figure; matches the §1 wall estimate).
+  - **Performance verdict** (same day, 5 M set, 16 cores): Python exact 20.5 s; Rust exact 16t 18.0–20.7 s (99 % CPU — the single-stream inflate floor, §8/M5 wall analysis); Rust approx 16t 19.7 s; Python approx 35.8 s (old direction — it purges the assigned files). Counts identical on all sides. The §8 ≤ 3 s / ≤ 5 s targets are **NOT met on single-lane single-file workloads** (they assume multi-lane workloads); the ≥ 2×-Python criterion is **NOT met at 5 M single-lane** (exact ≈ 1.0×, approx 1.8×) but **is met multi-lane** (4-lane 2.87×, §8/M5); the "≥ 50 M reads" clause is not evaluable — the largest available set is 5 M.
+  - **Rollout**: the changelog call-out for D1–D4 + the fixed approx path is a release task on the Python package (the Rust tree has no changelog convention); ship side-by-side per §8/Rollout.
+
 **Differential testing (the gate)**
 
 1. Build a reference dataset where name0s are **globally unique** (fixes the synthetic-data caveat from profiling: the current generator's coordinate space is seed-invariant and produces birthday-collision name0s, which inflates exact-mode duplicate counts).
@@ -273,28 +281,28 @@ New (documented) behaviours:
 
 **Edge cases (unit/integration)**
 
-- [ ] empty undetermined file; empty assigned dir (warning path)
-- [ ] zero duplicates → no output files, exact log string
-- [ ] all reads duplicated → empty (but existing) purged files
-- [ ] undetermined R2 missing (`(file, None)` path)
-- [ ] ungzipped `.fastq` input (output naming without `.gz`)
-- [ ] multi-lane (4 lanes × R1/R2) with cross-lane duplicates
-- [ ] assigned dir containing I1/I2 files (collapse + warning)
-- [ ] filenames without `_L00[0-9]{2}_` (warning + skip)
-- [ ] re-run with outputs present (purged files excluded from input discovery)
+- [x] empty undetermined file (M6 `empty_undetermined_file_runs_clean`); empty assigned dir (M1 validation differential)
+- [x] zero duplicates → no output files, exact log string (M3 `no_duplicates_writes_nothing`)
+- [x] all reads duplicated → empty (but existing) purged files (M6 `all_duplicated_writes_empty_purged_files`)
+- [x] undetermined R2 missing (`(file, None)` path) (M3 `single_read_lane`)
+- [x] ungzipped `.fastq` input (output naming without `.gz`) (M1 validation + M2 plain byte-exact differential)
+- [x] multi-lane (4 lanes × R1/R2) with cross-lane duplicates (M5 `two_lanes_cross_lane_dups` + the M5 4-lane dataset, byte-identical outputs)
+- [x] assigned dir containing I1/I2 files (collapse + warning) (M1 validation differential)
+- [x] filenames without `_L00[0-9]{2}_` (warning + skip) (M1 validation differential)
+- [x] re-run with outputs present (purged files excluded from input discovery) (M1/M3 differential re-runs)
 
 **Performance acceptance (5 M synthetic set, 16 cores)**
 
-- [ ] exact end-to-end ≤ 3 s (vs 9.1 s Python)
-- [ ] approx end-to-end ≤ 5 s (vs 38.4 s Python)
-- [ ] 100 M-name membership ≤ 2.5 GB RSS (measured, documented)
-- [ ] ≥ 2× the Python wall time at ≥ 50 M reads
+- [ ] exact end-to-end ≤ 3 s (vs 9.1 s Python) — **not met on the 5 M single-lane set** (18.0–20.7 s @ 16t, ≈ same-day Python 20.5 s): one file per pass ⇒ the single-stream inflate floor (§8/M5 wall analysis); the target assumes multi-lane workloads
+- [ ] approx end-to-end ≤ 5 s (vs 38.4 s Python) — **not met single-lane** (19.7 s @ 16t; same-day Python approx 35.8 s, old direction); same wall
+- [x] 100 M-name membership ≤ 2.5 GB RSS — **MET**: exact 1.13 GB, approx bloom 0.27 GB (`examples/mem_100m.rs`); Python `set[str]` ≈ 13.2 GB
+- [ ] ≥ 2× the Python wall time at ≥ 50 M reads — **not met at 5 M single-lane** (exact ≈ 1.0×, approx 1.8×); met multi-lane (4-lane 2.87× vs its own sequential run, §8/M5); the "≥ 50 M reads" clause is not evaluable (largest available set is 5 M)
 
 **Rollout**
 
 1. Milestones: (M1) CLI + discovery/validation port; (M2) FASTQ streaming + name0 hashing; (M3) exact pipeline single-threaded; (M4) bloom pipeline; (M5) rayon + progress; (M6) differential + perf validation. ~5–7 working days total.
 2. Ship `fastq-purge-rs` side-by-side; keep the Python package for one release cycle; compare on a real run before declaring the Python version deprecated.
-3. Changelog must call out D1/D2/D3 and the fixed approx path.
+3. Changelog must call out D1–D4 and the fixed approx path (a release task on the Python package — the Rust tree has no changelog).
 
 ## 9. Risks & open questions
 

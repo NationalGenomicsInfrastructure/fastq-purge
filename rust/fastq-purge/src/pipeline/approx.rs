@@ -108,8 +108,7 @@ pub fn run(config: &AppConfig) -> anyhow::Result<()> {
         .iter()
         .flat_map(|(_lane, fs)| fs.iter().map(PathBuf::as_path))
         .collect();
-    let scanned: Vec<ScanBlock> =
-        files.par_iter().map(|f| scan_file(f, &blooms)).collect();
+    let scanned: Vec<ScanBlock> = files.par_iter().map(|f| scan_file(f, &blooms)).collect();
     let mut dups: Vec<ExactSet> = (0..k).map(|_| ExactSet::new()).collect();
     for (i, s) in scanned.into_iter().enumerate() {
         let (mut parts, lines) = match s {
@@ -206,10 +205,7 @@ fn build_bloom(
 /// bloom probe hashes (once) and the exact hash, and collect the
 /// per-lane partial dups sets (idempotent insertion — the new-duplicate
 /// count is computed by the orchestrator at merge time).
-fn scan_file(
-    f: &Path,
-    blooms: &[Bloom64],
-) -> ScanBlock {
+fn scan_file(f: &Path, blooms: &[Bloom64]) -> ScanBlock {
     let k = blooms.len();
     let mut lines = Lines::default();
     lines.info(format!("Processing target file '{}'", file_name(f)));

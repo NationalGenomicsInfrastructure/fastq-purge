@@ -412,3 +412,56 @@ fn threading_warning_only_for_non_default_method() {
         "missing the M5 warning:\n{warned}"
     );
 }
+
+/// Gate edge case: all reads duplicated → the purged file exists but is
+/// empty (`Found {K} > 0` triggers the write; nothing is kept).
+#[test]
+fn all_duplicated_writes_empty_purged_files() {
+    let d = tmpdir("alldup");
+    // setup writes und names a..d; the assigned file covers all four
+    setup(&d, &["a", "b", "c", "d", "x"], false);
+    let stdout = run(&d, &[]);
+    assert!(
+        stdout.contains("Found 4 duplicates in the undetermined file."),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("    Removed 4 reads"), "stdout:\n{stdout}");
+    assert!(stdout.contains("    Kept 0 reads"), "stdout:\n{stdout}");
+    let p1 = d.join("out/Undetermined_S0_L001_R1_001.purged.fastq");
+    assert!(
+        p1.exists(),
+        "the purged file must exist even when nothing is kept"
+    );
+    assert_eq!(
+        std::fs::read(&p1).unwrap(),
+        b"",
+        "kept = 0 ⇒ empty purged file"
+    );
+}
+
+/// Gate edge case: an empty undetermined file (0 records) → count 0, no
+/// duplicates, no output files, clean `Done!`.
+#[test]
+fn empty_undetermined_file_runs_clean() {
+    let d = tmpdir("emptyund");
+    std::fs::create_dir_all(d.join("und")).unwrap();
+    std::fs::create_dir_all(d.join("assigned")).unwrap();
+    std::fs::create_dir_all(d.join("out")).unwrap();
+    std::fs::write(d.join("und/Undetermined_S0_L001_R1_001.fastq"), b"").unwrap();
+    write_fastq(&d.join("assigned/S1_L001_R1_001.fastq"), &["a"]);
+    let stdout = run(&d, &[]);
+    assert!(
+        stdout.contains("Number of undetermined reads: 0 (0.00 MB)"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Found 0 duplicates in the undetermined file."),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Found no duplicates in the undetermined reads. Exiting..."),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("Done!"), "stdout:\n{stdout}");
+    assert_eq!(std::fs::read_dir(d.join("out")).unwrap().count(), 0);
+}

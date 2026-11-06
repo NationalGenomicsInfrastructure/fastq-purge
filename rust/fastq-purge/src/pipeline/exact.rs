@@ -99,8 +99,7 @@ pub fn run(config: &AppConfig) -> anyhow::Result<()> {
         .iter()
         .flat_map(|(_lane, fs)| fs.iter().map(PathBuf::as_path))
         .collect();
-    let scanned: Vec<ScanBlock> =
-        files.par_iter().map(|f| scan_file(f, &sets)).collect();
+    let scanned: Vec<ScanBlock> = files.par_iter().map(|f| scan_file(f, &sets)).collect();
     let mut dups: Vec<ExactSet> = (0..k).map(|_| ExactSet::new()).collect();
     for (i, s) in scanned.into_iter().enumerate() {
         let (mut parts, lines) = match s {
@@ -188,10 +187,7 @@ fn build_set(r1: &Path) -> Result<(ExactSet, Lines), (Lines, anyhow::Error)> {
 /// lane, the partial set of lane-member name0 hashes seen in this file
 /// (insertion is idempotent — the per-file new-duplicate count is
 /// computed by the orchestrator at merge time, see `run`).
-fn scan_file(
-    f: &Path,
-    sets: &[ExactSet],
-) -> ScanBlock {
+fn scan_file(f: &Path, sets: &[ExactSet]) -> ScanBlock {
     let k = sets.len();
     let mut lines = Lines::default();
     lines.info(format!("Processing target file '{}'", file_name(f)));
