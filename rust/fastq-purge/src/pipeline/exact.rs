@@ -29,7 +29,7 @@
 //! Log contract (INFO level):
 //! ```text
 //! Using exact method
-//! Building membership set from undetermined reads...
+//! Building python set from undetermined reads...
 //!   (DEBUG) Adding '{und R1 file name}' to set            [per lane]
 //!   Number of undetermined reads: {N} ({MB:.2f} MB)       [per lane]
 //! Scanning assigned files for already-assigned reads...
@@ -65,7 +65,7 @@ pub fn run(config: &AppConfig) -> anyhow::Result<()> {
     // ---- pass 1: membership set per undetermined lane ----------------
     config
         .log
-        .info("Building membership set from undetermined reads...");
+        .info("Building python set from undetermined reads...");
     let built: Vec<Result<(ExactSet, Lines), (Lines, anyhow::Error)>> = config
         .undetermined
         .par_iter()
