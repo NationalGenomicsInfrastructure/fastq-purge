@@ -4,8 +4,9 @@
 //!
 //! Crate layout (M2): `cli` + `discovery` (M1), `fastq` streaming reader/
 //! writer + name0 handling (M2), `membership` (M2: exact set; M4: bloom),
-//! `pipeline` (M3/M4). The `fastq-dump` bin is a dev/verification tool used
-//! for differential testing against the Python implementation.
+//! `pipeline` (M3/M4), `samplesheet` (M7.1: the SampleSheet.csv parser for
+//! the alternate input mode). The `fastq-dump` bin is a dev/verification
+//! tool used for differential testing against the Python implementation.
 
 pub mod cli;
 pub mod discovery;
@@ -13,3 +14,5 @@ pub mod fastq;
 pub mod logging;
 pub mod membership;
 pub mod pipeline;
+pub mod samplesheet;
+pub mod sheetdiscovery;

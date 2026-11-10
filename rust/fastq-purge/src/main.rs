@@ -21,7 +21,13 @@ fn main() {
             match fastq_purge::pipeline::run(&config) {
                 Ok(()) => {}
                 Err(e) => {
-                    eprintln!("{e}");
+                    // An empty Display marks an error that was already
+                    // reported through the logger (M7 sheet-mode write
+                    // failure); printing it again would duplicate the line.
+                    let msg = e.to_string();
+                    if !msg.is_empty() {
+                        eprintln!("{msg}");
+                    }
                     std::process::exit(1);
                 }
             }

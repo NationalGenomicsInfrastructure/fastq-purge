@@ -134,6 +134,41 @@ fn normalize_read_segment(name: &str) -> String {
 ///
 /// Returns lanes in discovery (insertion) order.
 pub fn create_paired_dict(files: Vec<PathBuf>) -> Result<Vec<(String, UndeterminedLane)>, String> {
+    // Master's key: the 3rd underscore-separated token of the pattern.
+    paired_dict(files, |pattern| {
+        pattern
+            .split('_')
+            .nth(2)
+            .map(str::to_string)
+            .ok_or_else(|| format!("Undetermined file pattern '{pattern}' has no lane token"))
+    })
+}
+
+/// Port of the samplesheet branch's `create_undetermined_paired_dict`
+/// (ss_main.py): same pairing, but the lane key is the first
+/// `re.search(r"_L[0-9]{3}_")` match in the pattern (a clean error where
+/// the branch raises AttributeError on a missing match).
+pub(crate) fn create_undetermined_paired_dict(
+    files: Vec<PathBuf>,
+) -> Result<Vec<(String, UndeterminedLane)>, String> {
+    paired_dict(files, |pattern| {
+        lane_key(pattern).ok_or_else(|| {
+            format!(
+                "Undetermined file pattern '{pattern}' does not match the \
+                 expected pattern '_L[0-9]{{3}}_'"
+            )
+        })
+    })
+}
+
+/// Shared pairing core: `purged` exclusion, `_R[12]_` normalisation,
+/// deduplicated sorted (parent, pattern) re-glob, dict-overwrite lane
+/// assembly; the lane key is extracted by `key` (M1 parity: the 3rd
+/// `_`-token; samplesheet branch: the first `_L[0-9]{3}_` match).
+fn paired_dict(
+    files: Vec<PathBuf>,
+    key: impl Fn(&str) -> Result<String, String>,
+) -> Result<Vec<(String, UndeterminedLane)>, String> {
     let files: Vec<PathBuf> = files
         .into_iter()
         .filter(|p| !entry_name(p).unwrap_or("").contains("purged"))
@@ -155,14 +190,10 @@ pub fn create_paired_dict(files: Vec<PathBuf>) -> Result<Vec<(String, Undetermin
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut lanes: Vec<(String, UndeterminedLane)> = Vec::new();
     for (parent, pattern) in &patterns {
-        // Parity with Python's `pattern.split("_")[2]`: names with fewer
-        // than three underscore-separated tokens crash the Python CLI
-        // (IndexError); we fail cleanly.
-        let key = pattern
-            .split('_')
-            .nth(2)
-            .ok_or_else(|| format!("Undetermined file pattern '{pattern}' has no lane token"))?
-            .to_string();
+        // The M1 key extractor fails cleanly where the Python CLI crashes
+        // (documented deviation); the branch extractor does the same for
+        // its `_L[0-9]{3}_` pattern.
+        let k = key(pattern)?;
 
         let matches = glob_component(parent, pattern)?;
         // Parity with Python: exactly two matches -> (first, second)
@@ -180,11 +211,11 @@ pub fn create_paired_dict(files: Vec<PathBuf>) -> Result<Vec<(String, Undetermin
             }
         };
 
-        match index.get(&key) {
+        match index.get(&k) {
             Some(&pos) => lanes[pos].1 = lane, // overwrite, keep position
             None => {
-                index.insert(key.clone(), lanes.len());
-                lanes.push((key, lane));
+                index.insert(k.clone(), lanes.len());
+                lanes.push((k, lane));
             }
         }
     }

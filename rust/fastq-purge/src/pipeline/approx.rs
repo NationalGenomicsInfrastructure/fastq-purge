@@ -177,7 +177,7 @@ pub fn run(config: &AppConfig) -> anyhow::Result<()> {
 /// Returns the bloom plus the log lines in sequential emission order
 /// (`Adding ... to bloom filter`, then the count line, then the
 /// DEBUG size line).
-fn build_bloom(
+pub(crate) fn build_bloom(
     max_items: u64,
     fpr: f64,
     r1: &Path,
@@ -205,7 +205,7 @@ fn build_bloom(
 /// bloom probe hashes (once) and the exact hash, and collect the
 /// per-lane partial dups sets (idempotent insertion — the new-duplicate
 /// count is computed by the orchestrator at merge time).
-fn scan_file(f: &Path, blooms: &[Bloom64]) -> ScanBlock {
+pub(crate) fn scan_file(f: &Path, blooms: &[Bloom64]) -> ScanBlock {
     let k = blooms.len();
     let mut lines = Lines::default();
     lines.info(format!("Processing target file '{}'", file_name(f)));
