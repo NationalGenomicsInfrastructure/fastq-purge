@@ -10,6 +10,8 @@ use clap::Parser;
 
 use crate::discovery::{self, UndeterminedLane};
 use crate::logging::{Level, Logger};
+use crate::samplesheet;
+use crate::sheetdiscovery;
 
 /// The `--method` choice (parity with argparse `choices`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -78,12 +80,18 @@ impl LogLevel {
     override_usage = "fastq-purge-rs [options]"
 )]
 pub struct Cli {
+    /// Path to the flowcell directory. It is used to extract the lane
+    /// information from the SampleSheet.csv file, and to identify the
+    /// undetermined and assigned files.
+    #[arg(long)]
+    pub flowcell_path: Option<PathBuf>,
+
     /// Path to the target fastq file(s) to purge. It can be gzipped or not.
     /// It can be a single file or a directory. If a directory is provided,
     /// all files in the directory that match the pattern '*.fq*' or
     /// '*.fastq*' will be used as target files. The search is non-recursive.
-    #[arg(long, required = true)]
-    pub undetermined_path: PathBuf,
+    #[arg(long)]
+    pub undetermined_path: Option<PathBuf>,
 
     /// Path to the output fastq file
     #[arg(long)]
@@ -94,8 +102,21 @@ pub struct Cli {
     /// or a directory. If a directory is provided, all files in the
     /// directory that match the pattern '*.fq*' or '*.fastq*' will be used
     /// as bloom filter sources. The search is recursive.
-    #[arg(long, required = true, num_args = 1..)]
+    #[arg(long, num_args = 1..)]
     pub assigned_path: Vec<PathBuf>,
+
+    /// Path to the sample sheet file. It is used to extract the sample and
+    /// lane information, and to match the undetermined files with the
+    /// assigned files.
+    #[arg(long)]
+    pub sample_sheet: Option<PathBuf>,
+
+    /// Keep the original undetermined fastq files after purging. If this
+    /// option is not set, the original files will be removed after purging,
+    /// while if set, the purged files will be saved with the suffix
+    /// '.purged' added to the original file basename.
+    #[arg(long)]
+    pub keep_original: bool,
 
     /// Method to use for filtering. The 'exact' method uses a set to store
     /// the undetermined reads. The 'approx' method uses a bloom filter.
@@ -145,6 +166,19 @@ pub struct Cli {
 ///
 /// The pipeline fields are consumed from M3/M4 onward; M1's stub
 /// pipeline reads none of them.
+/// The input mode selected by the CLI (M7, decision D8):
+///
+/// * `Legacy` — no `--flowcell-path` and no `--sample-sheet`: the M1-M5
+///   directory-discovery behaviour, byte-identical.
+/// * `Sheet` — the SampleSheet alternate input mode (M7): per-lane
+///   pipeline; the undetermined originals are replaced in place unless
+///   `--keep-original` is set (decision D6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    Legacy,
+    Sheet,
+}
+
 #[allow(dead_code)]
 pub struct AppConfig {
     pub log: Logger,
@@ -155,7 +189,9 @@ pub struct AppConfig {
     pub output: Vec<(String, (PathBuf, Option<PathBuf>))>,
     /// Directory the output files live in (the resolved `--output-path`).
     pub output_dir: PathBuf,
-    /// lane key -> assigned source files, in discovery order.
+    /// lane key -> assigned source files, in discovery order. Sheet mode:
+    /// the per-project inner lists flattened in sheet order (empty inner
+    /// lists included, as in the branch).
     pub assigned: Vec<(String, Vec<PathBuf>)>,
     pub method: Method,
     pub max_items: u64,
@@ -165,6 +201,11 @@ pub struct AppConfig {
     /// D3: invert the canonical purge direction (purge assigned instead of
     /// undetermined).
     pub purge_assigned: bool,
+    /// The selected input mode (M7, D8).
+    pub mode: RunMode,
+    /// Sheet mode: keep the original undetermined files after purging
+    /// (D6; ignored in legacy mode).
+    pub keep_original: bool,
 }
 
 /// Validate `Cli` into an `AppConfig`, emitting the same log lines (same
@@ -188,9 +229,187 @@ fn logged_err(msg: String) -> (String, i32, bool) {
 pub fn validate(cli: Cli) -> Result<AppConfig, (String, i32, bool)> {
     let log = Logger::new(cli.log_level.level());
 
+    // ---- M7, D8: input-mode dispatch ------------------------------------
+    // * `--flowcell-path` (+ optional overrides): flowcell mode.
+    // * `--sample-sheet` without `--flowcell-path`: manual sheet mode
+    //   (D5: the branch crashes here with AttributeError on
+    //   `None.is_dir()`; we implement the intended else-branch).
+    // * Neither: the legacy M1-M5 directory-discovery mode.
+    let fc = cli.flowcell_path.clone();
+    let sheet_arg = cli.sample_sheet.clone();
+    let und_arg = cli.undetermined_path.clone();
+    let assigned_arg = cli.assigned_path.clone();
+
+    if let Some(fc) = fc {
+        if !fc.is_dir() {
+            return Err(logged_err(format!(
+                "Flowcell path '{}' is not a valid directory! Please provide a valid flowcell path.",
+                fc.display()
+            )));
+        }
+        log.debug("Flowcell path provided! Validating paths...");
+        let sheet = match &sheet_arg {
+            Some(s) => s.clone(),
+            None => find_flowcell_sheet(&fc).ok_or_else(|| {
+                // The branch indexes [-1] of an empty list (IndexError);
+                // we fail cleanly (M1 precedent).
+                err(format!(
+                    "No sample sheet found in flowcell '{}'. Please provide a valid sample sheet file.",
+                    fc.display()
+                ))
+            })?,
+        };
+        let assigned = if assigned_arg.is_empty() {
+            vec![fc.clone()]
+        } else {
+            assigned_arg
+        };
+        let und = und_arg.unwrap_or(fc);
+        return validate_sheet_mode(cli, log, sheet, Some(und), assigned);
+    }
+    if let Some(sheet) = sheet_arg {
+        log.info("No flowcell path provided, using manually provided arguments");
+        return validate_sheet_mode(cli, log, sheet, und_arg, assigned_arg);
+    }
+    validate_legacy(cli, log)
+}
+
+/// Sheet-mode validation: the branch's `validate_args` common checks +
+/// `parse_sample_sheet` + `process_args` discovery (sheetdiscovery).
+fn validate_sheet_mode(
+    cli: Cli,
+    log: Logger,
+    sheet: PathBuf,
+    und: Option<PathBuf>,
+    assigned: Vec<PathBuf>,
+) -> Result<AppConfig, (String, i32, bool)> {
+    if !sheet.is_file() {
+        return Err(logged_err(
+            "No sample sheet provided or found! Please provide a valid sample sheet file."
+                .to_string(),
+        ));
+    }
+    let und = match und {
+        Some(p) if p.exists() => p,
+        _ => {
+            return Err(logged_err(
+                "No undetermined path provided or found! Please provide a valid undetermined fastq file."
+                    .to_string(),
+            ))
+        }
+    };
+    if assigned.is_empty() || !assigned.iter().all(|p| p.exists()) {
+        return Err(logged_err(
+            "No assigned path provided or found! Please provide assigned fastq file(s) or directory."
+                .to_string(),
+        ));
+    }
+    log.debug("Success! All paths are valid.");
+
+    if cli.purge_assigned {
+        return Err(err(
+            "--purge-assigned is only supported in directory-discovery mode (it is not part of the SampleSheet input mode).".to_string(),
+        ));
+    }
+
+    let data = samplesheet::parse(&sheet).map_err(|e| (format!("{e}"), 1, false))?;
+    let sheet_plan = sheetdiscovery::plan(
+        &und,
+        &assigned,
+        cli.output_path.as_deref().map(Path::new),
+        &data,
+        &log,
+    )
+    .map_err(|(msg, logged)| (msg, 1, logged))?;
+
+    let undetermined: Vec<(String, UndeterminedLane)> = sheet_plan
+        .lanes
+        .iter()
+        .map(|l| (l.key.clone(), l.undetermined.clone()))
+        .collect();
+    let output: Vec<(String, (PathBuf, Option<PathBuf>))> = sheet_plan
+        .lanes
+        .iter()
+        .map(|l| (l.key.clone(), l.output.clone()))
+        .collect();
+    let assigned: Vec<(String, Vec<PathBuf>)> = sheet_plan
+        .lanes
+        .iter()
+        .map(|l| {
+            (
+                l.key.clone(),
+                l.assigned.iter().flatten().cloned().collect(),
+            )
+        })
+        .collect();
+
+    Ok(AppConfig {
+        log,
+        undetermined,
+        output,
+        output_dir: sheet_plan.output_dir,
+        assigned,
+        method: cli.method,
+        max_items: cli.max_items,
+        fpr: cli.fpr,
+        threads: cli.threads,
+        threading_method: cli.threading_method,
+        purge_assigned: false,
+        mode: RunMode::Sheet,
+        keep_original: cli.keep_original,
+    })
+}
+
+/// The last flowcell entry (directory-entry order) whose name matches the
+/// branch regex `^SampleSheet.(csv|txt)$` — unescaped dots, so the two dot
+/// positions are any single character.
+fn find_flowcell_sheet(fc: &Path) -> Option<PathBuf> {
+    let mut last = None;
+    for entry in std::fs::read_dir(fc).ok()?.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if is_sample_sheet_name(&name) {
+            last = Some(entry.path());
+        }
+    }
+    last
+}
+
+fn is_sample_sheet_name(name: &str) -> bool {
+    let b = name
+        .strip_prefix("SampleSheet")
+        .unwrap_or_default()
+        .as_bytes();
+    b.len() == 4 && (b[1..] == *b"csv" || b[1..] == *b"txt")
+}
+
+/// Legacy (M1-M5) directory-discovery validation, byte-identical to the
+/// pre-M7 behaviour.
+fn validate_legacy(cli: Cli, log: Logger) -> Result<AppConfig, (String, i32, bool)> {
+    // Usage errors (rc 2). The path flags are optional at the parser level
+    // since M7, so the required-argument check is manual here, reproducing
+    // clap's error text captured pre-M7.
+    let mut missing = Vec::new();
+    if cli.undetermined_path.is_none() {
+        missing.push("  --undetermined-path <UNDETERMINED_PATH>".to_string());
+    }
+    if cli.assigned_path.is_empty() {
+        missing.push("  --assigned-path <ASSIGNED_PATH>...".to_string());
+    }
+    if !missing.is_empty() {
+        return Err((
+            format!(
+                "error: the following required arguments were not provided:\n{}\n\nUsage: fastq-purge-rs [options]\n\nFor more information, try '--help'.",
+                missing.join("\n")
+            ),
+            2,
+            false,
+        ));
+    }
+    let und_path = cli.undetermined_path.clone().unwrap();
+
     // ---- undetermined -------------------------------------------------
-    let un_files =
-        discovery::explode_path(&cli.undetermined_path, false, &log).map_err(logged_err)?;
+    let un_files = discovery::explode_path(&und_path, false, &log).map_err(logged_err)?;
 
     let undetermined = discovery::create_paired_dict(un_files).map_err(err)?;
     if undetermined.is_empty() {
@@ -198,7 +417,7 @@ pub fn validate(cli: Cli) -> Result<AppConfig, (String, i32, bool)> {
         // we fail cleanly instead.
         return Err(err(format!(
             "No undetermined files found in '{}' (pattern '*.fq*' or '*.fastq*')",
-            cli.undetermined_path.display()
+            und_path.display()
         )));
     }
 
@@ -307,5 +526,7 @@ pub fn validate(cli: Cli) -> Result<AppConfig, (String, i32, bool)> {
         threads: cli.threads,
         threading_method: cli.threading_method,
         purge_assigned: cli.purge_assigned,
+        mode: RunMode::Legacy,
+        keep_original: false,
     })
 }

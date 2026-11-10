@@ -15,3 +15,4 @@ pub mod logging;
 pub mod membership;
 pub mod pipeline;
 pub mod samplesheet;
+pub mod sheetdiscovery;
