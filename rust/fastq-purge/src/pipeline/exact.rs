@@ -169,7 +169,7 @@ pub fn run(config: &AppConfig) -> anyhow::Result<()> {
 /// Pass-1 worker: stream one undetermined R1 file into an `ExactSet`.
 /// Returns the set plus the log lines in sequential emission order
 /// (`Adding ... to set` first, then the count line).
-fn build_set(r1: &Path) -> Result<(ExactSet, Lines), (Lines, anyhow::Error)> {
+pub(crate) fn build_set(r1: &Path) -> Result<(ExactSet, Lines), (Lines, anyhow::Error)> {
     let mut lines = Lines::default();
     lines.debug(format!("Adding '{}' to set", file_name(r1)));
     let mut set = ExactSet::new();
@@ -187,7 +187,7 @@ fn build_set(r1: &Path) -> Result<(ExactSet, Lines), (Lines, anyhow::Error)> {
 /// lane, the partial set of lane-member name0 hashes seen in this file
 /// (insertion is idempotent — the per-file new-duplicate count is
 /// computed by the orchestrator at merge time, see `run`).
-fn scan_file(f: &Path, sets: &[ExactSet]) -> ScanBlock {
+pub(crate) fn scan_file(f: &Path, sets: &[ExactSet]) -> ScanBlock {
     let k = sets.len();
     let mut lines = Lines::default();
     lines.info(format!("Processing target file '{}'", file_name(f)));

@@ -4,6 +4,7 @@
 
 pub mod approx;
 pub mod exact;
+pub mod sheet;
 
 use crate::cli::{AppConfig, Method, ThreadingMethod};
 use crate::logging::{Level, Logger};
@@ -23,11 +24,33 @@ pub fn run(config: &AppConfig) -> anyhow::Result<()> {
         ));
     }
 
+    // M7: the SampleSheet input mode runs the branch's per-lane contract
+    // instead of the canonical global 3-pass (D8 superset).
+    if config.mode == crate::cli::RunMode::Sheet {
+        return sheet::run(config);
+    }
+
     match config.method {
         Method::Exact => exact::run(config),
         Method::Approx => approx::run(config),
     }
 }
+
+/// A pipeline error that has already been reported through the logger
+/// (the branch-style ERROR line on a sheet-mode write failure). `main`
+/// prints pipeline errors to stderr — except when the Display is empty,
+/// which marks an already-logged error.
+#[derive(Debug)]
+pub struct Logged;
+
+impl std::fmt::Display for Logged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Intentionally empty: the message was already logged.
+        f.write_str("")
+    }
+}
+
+impl std::error::Error for Logged {}
 
 /// Log lines collected by a pass worker, in the order the sequential run
 /// would have printed them (the M5 deterministic-log rule: workers never
@@ -54,6 +77,25 @@ impl Lines {
 
     pub fn into_vec(self) -> Vec<(Level, String)> {
         self.v
+    }
+
+    /// A copy of the buffer (for flushes that must not consume it).
+    pub(crate) fn to_vec(&self) -> Vec<(Level, String)> {
+        self.v.clone()
+    }
+
+    /// Append another block's lines (M7: combining a worker block with
+    /// the lane's running block).
+    pub(crate) fn append(&mut self, other: Lines) {
+        self.v.extend(other.v);
+    }
+
+    /// Append the `memory_usage` line pair (M7 sheet mode; /proc/meminfo,
+    /// live values — the differential normalizes these lines).
+    pub(crate) fn append_mem(&mut self, pid: Option<u32>) {
+        for msg in sheet::mem_lines(pid) {
+            self.debug(msg);
+        }
     }
 }
 
