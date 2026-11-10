@@ -31,7 +31,8 @@
 //! Using bloom filter method
 //! Building bloom filter...
 //!   (DEBUG) Adding '{und R1 file name}' to bloom filter     [per lane]
-//!   (DEBUG) Bloom filter: {bits} bits, {k} probes, {n} items [per lane]
+//!   (DEBUG) Bloom filter: {bits} bits, {k} probes, sized for {n} items [per lane]
+//!         (n = the sizing target, --max-items default 1e9; the observed count is in the INFO line above)
 //!   Number of undetermined reads: {N} ({MB:.2} MB)          [per lane]
 //! Scanning assigned files for already-assigned reads...
 //!   Processing target file '{assigned file name}'           [per file]
@@ -193,7 +194,7 @@ pub(crate) fn build_bloom(
     let mb = bloom.estimated_bytes() as f64 / 1024.0 / 1024.0;
     lines.info(format!("Number of undetermined reads: {n} ({mb:.2} MB)"));
     lines.debug(format!(
-        "Bloom filter: {} bits, {} probes, {} items",
+        "Bloom filter: {} bits, {} probes, sized for {} items",
         bloom.bits(),
         bloom.k(),
         bloom.capacity()
