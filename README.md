@@ -2,6 +2,10 @@
 
 Python package for removing from a set of FASTQ files reads that are present in another set of FASTQ files.
 
+## Rust implementation
+
+A Rust rewrite, `fastq-purge-rs`, is being rolled out as the replacement for this package (crate workspace at `rust/fastq-purge/`). It implements the canonical semantics defined in `RUST_REWRITE.md` — both methods purge the _undetermined_ files, comparing by name0, with a per-lane bloom filter bounding memory — and is threaded (rayon) instead of process-pooled. It has been differentially verified against this CLI: byte-identical purged outputs after decompression, including a side-by-side run on a real NovaSeqX flowcell (2026-11-10). This Python CLI will be deprecated once the rollout completes. See `RUST_REWRITE.md` for the design, decisions and rollout status, and `CHANGELOG.md` for user-facing changes.
+
 ## Motivation
 
 When demultiplexing a sequencing run that contains multiple sequencing designs, it is common to have reads belonging to one design ending up in the _undetermined_ FASTQ files of another design. In such cases, to avoid including duplicates, the _undetermined_ files for one or more lanes are not preserved, and their metrics will not available in GenStat. To resolve this, the _undetermined_ FASTQ files need to be purged of reads that are have been already assigned in either of the samples run on the same lane/flowcell. This package aims at providing a performance-optimized solution to this problem.
